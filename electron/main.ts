@@ -4,15 +4,19 @@ import {
   clipboard,
   dialog,
   ipcMain,
+  IpcMainInvokeEvent,
   nativeTheme,
   screen,
+  session,
   shell
 } from 'electron';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import { ServiceConfig } from '../shared/types';
+import { writeFileAtomic } from './fsUtils';
 import { ProcessManager } from './processManager';
 import { scanFolderForServices } from './workspaceScanner';
 
@@ -29,6 +33,51 @@ const windowPopoutServiceMap = new Map<number, string>();
 let mainWindow: BrowserWindow | null = null;
 let processManager: ProcessManager;
 let isQuitting = false;
+
+// The renderer can run arbitrary shell commands through IPC, so only our own
+// pages may load in app windows or call IPC handlers.
+const RENDERER_INDEX_PATH = path.join(__dirname, '../../dist/index.html');
+const trustedOrigins = new Set<string>();
+
+function isTrustedRendererUrl(rawUrl: string): boolean {
+  try {
+    const url = new URL(rawUrl);
+    if (url.protocol === 'file:') {
+      return (
+        path.resolve(fileURLToPath(url)).toLowerCase() ===
+        path.resolve(RENDERER_INDEX_PATH).toLowerCase()
+      );
+    }
+    return trustedOrigins.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedSender(event: IpcMainInvokeEvent): boolean {
+  const frame = event.senderFrame;
+  return Boolean(frame && frame.parent === null && isTrustedRendererUrl(frame.url));
+}
+
+type IpcHandler = (event: IpcMainInvokeEvent, ...args: any[]) => unknown;
+
+function handle(channel: string, listener: IpcHandler): void {
+  ipcMain.handle(channel, (event, ...args) => {
+    if (!isTrustedSender(event)) {
+      throw new Error(`Blocked IPC call to "${channel}" from an untrusted page`);
+    }
+    return listener(event, ...args);
+  });
+}
+
+function isExistingDirectory(folderPath: unknown): folderPath is string {
+  if (typeof folderPath !== 'string' || !folderPath) return false;
+  try {
+    return fs.statSync(folderPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
 
 function getWindowStatePath(): string {
   return path.join(app.getPath('userData'), 'window-state.json');
@@ -121,16 +170,18 @@ async function loadRenderer(
     : '';
 
   if (explicitUrl) {
+    trustedOrigins.add(new URL(explicitUrl).origin);
     await win.loadURL(`${explicitUrl}${query}`);
     return;
   }
 
   if (!app.isPackaged && (await isLocalPortOpen(5174))) {
+    trustedOrigins.add('http://localhost:5174');
     await win.loadURL(`http://localhost:5174${query}`);
     return;
   }
 
-  await win.loadFile(path.join(__dirname, '../../dist/index.html'), {
+  await win.loadFile(RENDERER_INDEX_PATH, {
     query: popoutServiceId ? { popoutServiceId } : undefined
   });
 }
@@ -161,7 +212,8 @@ function createMainWindow(): BrowserWindow {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
 
@@ -254,7 +306,8 @@ function openPopoutWindow(serviceId: string, serviceName?: string): void {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      sandbox: true
     }
   });
 
@@ -271,7 +324,7 @@ function openPopoutWindow(serviceId: string, serviceName?: string): void {
 }
 
 function registerIpcHandlers(): void {
-  ipcMain.handle('app:bootstrap', (event) => {
+  handle('app:bootstrap', (event) => {
     const popoutServiceId =
       windowPopoutServiceMap.get(event.sender.id) ?? null;
     return {
@@ -281,11 +334,11 @@ function registerIpcHandlers(): void {
     };
   });
 
-  ipcMain.handle('storage:switchToGlobal', () =>
+  handle('storage:switchToGlobal', () =>
     processManager.switchToGlobal()
   );
 
-  ipcMain.handle(
+  handle(
     'storage:openWorkspace',
     async (event, folderPath?: string) => {
       let target = folderPath;
@@ -305,7 +358,7 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle('storage:saveCopyToWorkspace', async (event) => {
+  handle('storage:saveCopyToWorkspace', async (event) => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const options: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
@@ -318,15 +371,15 @@ function registerIpcHandlers(): void {
     return processManager.saveCopyToWorkspace(result.filePaths[0]);
   });
 
-  ipcMain.handle('storage:removeRecent', (_e, folderPath: string) =>
+  handle('storage:removeRecent', (_e, folderPath: string) =>
     processManager.removeRecentWorkspace(folderPath)
   );
 
-  ipcMain.handle('process:getLogs', (_e, serviceId: string) =>
+  handle('process:getLogs', (_e, serviceId: string) =>
     processManager.getLogs(serviceId)
   );
 
-  ipcMain.handle(
+  handle(
     'process:upsert',
     (
       _e,
@@ -338,11 +391,11 @@ function registerIpcHandlers(): void {
     ) => processManager.upsertService(input)
   );
 
-  ipcMain.handle('process:delete', (_e, serviceId: string) =>
+  handle('process:delete', (_e, serviceId: string) =>
     processManager.deleteService(serviceId)
   );
 
-  ipcMain.handle(
+  handle(
     'process:reorder',
     (
       _e,
@@ -352,51 +405,52 @@ function registerIpcHandlers(): void {
     ) => processManager.reorderService(draggedId, targetId, position)
   );
 
-  ipcMain.handle('process:start', (_e, serviceId: string) =>
+  handle('process:start', (_e, serviceId: string) =>
     processManager.startService(serviceId)
   );
 
-  ipcMain.handle('process:stop', (_e, serviceId: string, force?: boolean) =>
+  handle('process:stop', (_e, serviceId: string, force?: boolean) =>
     processManager.stopService(serviceId, Boolean(force))
   );
 
-  ipcMain.handle('process:restart', (_e, serviceId: string) =>
+  handle('process:restart', (_e, serviceId: string) =>
     processManager.restartService(serviceId)
   );
 
-  ipcMain.handle('process:clearLogs', (_e, serviceId: string) =>
+  handle('process:clearLogs', (_e, serviceId: string) =>
     processManager.clearLogs(serviceId)
   );
 
-  ipcMain.handle('process:startGroup', (_e, groupName: string) =>
+  handle('process:startGroup', (_e, groupName: string) =>
     processManager.startGroup(groupName)
   );
 
-  ipcMain.handle('process:stopGroup', (_e, groupName: string) =>
+  handle('process:stopGroup', (_e, groupName: string) =>
     processManager.stopGroup(groupName)
   );
 
-  ipcMain.handle('process:startAll', () => processManager.startAll());
+  handle('process:startAll', () => processManager.startAll());
 
-  ipcMain.handle('process:stopAll', (_e, force?: boolean) =>
+  handle('process:stopAll', (_e, force?: boolean) =>
     processManager.stopAll(Boolean(force))
   );
 
-  ipcMain.handle('process:killPort', (_e, port: number) =>
+  handle('process:killPort', (_e, port: number) =>
     processManager.killPort(port)
   );
 
-  ipcMain.handle(
+  handle(
     'window:openPopout',
     (_e, serviceId: string, serviceName?: string) => {
       openPopoutWindow(serviceId, serviceName);
     }
   );
 
-  ipcMain.handle(
+  handle(
     'shell:showInExplorer',
     async (_e, folderPath: string): Promise<{ ok: boolean; error?: string }> => {
-      if (!folderPath || !fs.existsSync(folderPath)) {
+      // shell.openPath runs files, so only ever hand it a directory.
+      if (!isExistingDirectory(folderPath)) {
         return {
           ok: false,
           error: `Working directory does not exist: ${folderPath}`
@@ -407,10 +461,10 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle(
+  handle(
     'shell:openTerminal',
     async (_e, folderPath: string): Promise<{ ok: boolean; error?: string }> => {
-      if (!folderPath || !fs.existsSync(folderPath)) {
+      if (!isExistingDirectory(folderPath)) {
         return {
           ok: false,
           error: `Working directory does not exist: ${folderPath}`
@@ -464,7 +518,7 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle('dialog:pickFolder', async (event) => {
+  handle('dialog:pickFolder', async (event) => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const options: Electron.OpenDialogOptions = {
       properties: ['openDirectory'],
@@ -477,18 +531,18 @@ function registerIpcHandlers(): void {
     return result.filePaths[0];
   });
 
-  ipcMain.handle('workspace:scanFolder', async (_e, folderPath: string) => {
+  handle('workspace:scanFolder', async (_e, folderPath: string) => {
     return scanFolderForServices(folderPath);
   });
 
-  ipcMain.handle(
+  handle(
     'process:importMany',
     (_e, configs: ServiceConfig[], replaceAll?: boolean) => {
       return processManager.importConfigs(configs, Boolean(replaceAll));
     }
   );
 
-  ipcMain.handle('dialog:exportConfigs', async (event) => {
+  handle('dialog:exportConfigs', async (event) => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const options: Electron.SaveDialogOptions = {
       title: 'Export Service Configurations',
@@ -499,12 +553,13 @@ function registerIpcHandlers(): void {
       ? await dialog.showSaveDialog(parent, options)
       : await dialog.showSaveDialog(options);
     if (result.canceled || !result.filePath) return false;
-    const data = processManager.exportConfigs();
-    fs.writeFileSync(result.filePath, JSON.stringify(data, null, 2), 'utf8');
+    // Store paths relative to the export file's folder, which is what import resolves against.
+    const data = processManager.exportConfigs(path.dirname(result.filePath));
+    writeFileAtomic(result.filePath, JSON.stringify(data, null, 2));
     return true;
   });
 
-  ipcMain.handle('dialog:importConfigs', async (event) => {
+  handle('dialog:importConfigs', async (event) => {
     const parent = BrowserWindow.fromWebContents(event.sender);
     const options: Electron.OpenDialogOptions = {
       title: 'Import Service Configurations',
@@ -540,7 +595,7 @@ function registerIpcHandlers(): void {
     return processManager.importConfigs(resolvedList, false);
   });
 
-  ipcMain.handle(
+  handle(
     'dialog:saveLogText',
     async (event, defaultName: string, content: string) => {
       const parent = BrowserWindow.fromWebContents(event.sender);
@@ -561,11 +616,11 @@ function registerIpcHandlers(): void {
     }
   );
 
-  ipcMain.handle('clipboard:writeText', (_e, text: string) => {
+  handle('clipboard:writeText', (_e, text: string) => {
     clipboard.writeText(text);
   });
 
-  ipcMain.handle(
+  handle(
     'theme:setSource',
     (_e, source: 'system' | 'light' | 'dark') => {
       nativeTheme.themeSource = source;
@@ -589,7 +644,21 @@ function getCliWorkspaceRoot(): string | null {
   return null;
 }
 
+// Keep every window on our own pages: no popups, no navigating away (including
+// files dropped onto the window), and no embedded webviews.
+app.on('web-contents-created', (_event, contents) => {
+  contents.setWindowOpenHandler(() => ({ action: 'deny' }));
+  contents.on('will-navigate', (event, url) => {
+    if (!isTrustedRendererUrl(url)) event.preventDefault();
+  });
+  contents.on('will-attach-webview', (event) => event.preventDefault());
+});
+
 app.whenReady().then(() => {
+  // The UI needs no camera, notifications, geolocation, etc.
+  session.defaultSession.setPermissionRequestHandler((_wc, _permission, callback) =>
+    callback(false)
+  );
   processManager = new ProcessManager(getCliWorkspaceRoot());
   registerIpcHandlers();
   createMainWindow();

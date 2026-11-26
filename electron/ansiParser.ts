@@ -100,16 +100,30 @@ export function parseAnsiLine(input: string): {
         fg = undefined;
       } else if (code === 49) {
         bg = undefined;
+      } else if (code === 38 || code === 48) {
+        // Extended colour: 38/48;5;n (256-colour) or 38/48;2;r;g;b (truecolor).
+        // Always consume the sub-parameters so they are not misread as other SGR codes.
+        let color: string | undefined;
+        const mode = codes[i + 1];
+        if (mode === 5) {
+          if (codes[i + 2] !== undefined) color = ansi256ToHex(codes[i + 2]);
+          i += 2;
+        } else if (mode === 2) {
+          if (codes[i + 4] !== undefined) {
+            color = rgbToHex(codes[i + 2], codes[i + 3], codes[i + 4]);
+          }
+          i += 4;
+        } else {
+          i += 1;
+        }
+        if (color) {
+          if (code === 38) fg = color;
+          else bg = color;
+        }
       } else if (FG_COLORS[code]) {
         fg = FG_COLORS[code];
       } else if (BG_COLORS[code]) {
         bg = BG_COLORS[code];
-      } else if (code === 38 && codes[i + 1] === 5 && codes[i + 2] !== undefined) {
-        fg = ansi256ToHex(codes[i + 2]);
-        i += 2;
-      } else if (code === 48 && codes[i + 1] === 5 && codes[i + 2] !== undefined) {
-        bg = ansi256ToHex(codes[i + 2]);
-        i += 2;
       }
     }
 
@@ -133,6 +147,14 @@ export function parseAnsiLine(input: string): {
   }
 
   return { raw, spans };
+}
+
+function rgbToHex(r: number, g: number, b: number): string {
+  const clamp = (v: number) => Math.max(0, Math.min(255, Math.round(v)));
+  return (
+    '#' +
+    [r, g, b].map((v) => clamp(v).toString(16).padStart(2, '0')).join('')
+  );
 }
 
 function ansi256ToHex(n: number): string {

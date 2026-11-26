@@ -24,7 +24,10 @@ export interface AnsiSpan {
 }
 
 export interface LogLine {
+  /** Per-service line number shown in the console gutter. */
   id: number;
+  /** Globally unique, monotonically increasing sequence used for de-duplication and React keys. */
+  seq: number;
   serviceId: string;
   timestamp: number;
   stream: 'stdout' | 'stderr' | 'system';
@@ -94,6 +97,8 @@ export interface ConfigStorageState {
   workspaceRoot: string | null;
   configFilePath: string;
   recentWorkspaces: string[];
+  /** Set when the config file could not be read and a backup of it was made. */
+  loadWarning: string | null;
 }
 
 export interface WorkspaceSwitchResult {

@@ -68,6 +68,7 @@ export interface MultiServiceConsoleApi {
     callback: (snapshots: ServiceSnapshot[]) => void
   ) => () => void;
   onStorageUpdate: (callback: (storage: ConfigStorageState) => void) => () => void;
+  onAppError: (callback: (message: string) => void) => () => void;
 }
 
 const api: MultiServiceConsoleApi = {
@@ -148,6 +149,12 @@ const api: MultiServiceConsoleApi = {
     ) => callback(data);
     ipcRenderer.on('process:storage', handler);
     return () => ipcRenderer.removeListener('process:storage', handler);
+  },
+  onAppError: (callback) => {
+    const handler = (_e: Electron.IpcRendererEvent, message: string) =>
+      callback(message);
+    ipcRenderer.on('app:error', handler);
+    return () => ipcRenderer.removeListener('app:error', handler);
   }
 };
 

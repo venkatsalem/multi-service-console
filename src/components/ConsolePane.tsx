@@ -250,8 +250,16 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
     }
   }, [matchRowIndices.length, activeMatchIdx]);
 
+  // Key rows by line rather than by position, so cached row heights stay attached to the
+  // right line when old lines are trimmed off the top of the buffer.
+  const getItemKey = useCallback(
+    (index: number) => filteredLogs[index]?.seq ?? index,
+    [filteredLogs]
+  );
+
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
+    getItemKey,
     getScrollElement: () => scrollContainerRef.current,
     estimateSize: () => Math.max(16, Math.round(consoleFontSize * 1.5) + 2),
     overscan: 24
@@ -922,7 +930,7 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
                 const isActiveMatch = virtualRow.index === activeMatchRow;
                 return (
                   <div
-                    key={line.id}
+                    key={virtualRow.key}
                     data-index={virtualRow.index}
                     ref={virtualizer.measureElement}
                     style={{

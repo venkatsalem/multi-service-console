@@ -17,12 +17,25 @@ import {
   isStackTraceContinuation,
   parseAnsiLine
 } from './ansiParser';
+import { backupUnreadableFile, writeFileAtomic } from './fsUtils';
 
 const MAX_LOG_LINES = 25_000;
+// Trim the log buffer in chunks so we don't shift a 25k-element array on every line.
+const LOG_TRIM_CHUNK = 1_000;
 const BATCH_FLUSH_MS = 60;
 const PROCESS_POLL_MS = 3000;
+const PROCESS_TABLE_TIMEOUT_MS = 8000;
 const WORKSPACE_CONFIG_FILENAME = 'multi-service-console.json';
 const MAX_RECENT_WORKSPACES = 10;
+const PROCESS_TABLE_PS =
+  'Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress';
+
+let nextGlobalLineSeq = 1;
+
+interface ProcessTable {
+  childrenByParent: Map<number, number[]>;
+  parentOf: Map<number, number>;
+}
 
 interface AppSettingsFile {
   mode: 'global' | 'workspace';
@@ -75,11 +88,56 @@ function compileReadyRegex(pattern?: string): RegExp | null {
   }
 }
 
+function createManagedService(config: ServiceConfig): ManagedService {
+  return {
+    config,
+    runtime: createInitialRuntime(config.id),
+    child: null,
+    logs: [],
+    nextLineId: 1,
+    nextErrorBlockId: 1,
+    activeErrorBlockId: null,
+    lastErrorAt: 0,
+    pendingBatch: [],
+    stopRequested: false,
+    readyRegex: compileReadyRegex(config.readyPattern),
+    killTimer: null
+  };
+}
+
+/** Express absCwd relative to baseDir when it lives inside it; otherwise keep it absolute. */
+function relativizeCwd(absCwd: string, baseDir: string): string {
+  const rel = path.relative(baseDir, absCwd);
+  if (!rel) return '.';
+  if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+    return `./${rel.replace(/\\/g, '/')}`;
+  }
+  return absCwd;
+}
+
+function collectDescendants(table: ProcessTable, rootPid: number): number[] {
+  const descendants: number[] = [];
+  const queue = [rootPid];
+  const visited = new Set<number>([rootPid]);
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const kid of table.childrenByParent.get(current) ?? []) {
+      if (!visited.has(kid)) {
+        visited.add(kid);
+        descendants.push(kid);
+        queue.push(kid);
+      }
+    }
+  }
+  return descendants;
+}
+
 export class ProcessManager {
   private services = new Map<string, ManagedService>();
   private flushTimer: NodeJS.Timeout | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private pollInFlight = false;
+  private configSaveBlocked = false;
   private globalConfigPath: string;
   private settingsPath: string;
   private storageState: ConfigStorageState;
@@ -125,7 +183,8 @@ export class ProcessManager {
         mode === 'workspace' && workspaceRoot
           ? path.join(workspaceRoot, WORKSPACE_CONFIG_FILENAME)
           : this.globalConfigPath,
-      recentWorkspaces
+      recentWorkspaces,
+      loadWarning: null
     };
     this.saveSettings(state);
     return state;
@@ -157,17 +216,12 @@ export class ProcessManager {
 
   private saveSettings(state: ConfigStorageState): void {
     try {
-      fs.mkdirSync(path.dirname(this.settingsPath), { recursive: true });
       const payload: AppSettingsFile = {
         mode: state.mode,
         workspaceRoot: state.workspaceRoot,
         recentWorkspaces: state.recentWorkspaces
       };
-      fs.writeFileSync(
-        this.settingsPath,
-        JSON.stringify(payload, null, 2),
-        'utf8'
-      );
+      writeFileAtomic(this.settingsPath, JSON.stringify(payload, null, 2));
     } catch {
       // Ignore settings write failure
     }
@@ -200,12 +254,7 @@ export class ProcessManager {
     ) {
       return absCwd;
     }
-    const rel = path.relative(this.storageState.workspaceRoot, absCwd);
-    if (!rel) return '.';
-    if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
-      return `./${rel.replace(/\\/g, '/')}`;
-    }
-    return absCwd;
+    return relativizeCwd(absCwd, this.storageState.workspaceRoot);
   }
 
   private parseConfigArray(raw: string): ServiceConfig[] {
@@ -214,68 +263,82 @@ export class ProcessManager {
     if (parsed && typeof parsed === 'object' && Array.isArray(parsed.services)) {
       return parsed.services;
     }
-    return [];
+    throw new Error('expected an array of services or { "services": [...] }');
   }
 
   private loadConfigs(): void {
     this.services.clear();
-    try {
-      if (!fs.existsSync(this.storageState.configFilePath)) {
-        return;
-      }
-      const raw = fs.readFileSync(this.storageState.configFilePath, 'utf8');
-      const list = this.parseConfigArray(raw);
+    this.storageState.loadWarning = null;
+    this.configSaveBlocked = false;
+    const filePath = this.storageState.configFilePath;
+    if (!fs.existsSync(filePath)) {
+      return;
+    }
 
-      for (const rawCfg of list) {
-        if (
-          !rawCfg ||
-          typeof rawCfg.id !== 'string' ||
-          typeof rawCfg.name !== 'string' ||
-          typeof rawCfg.command !== 'string' ||
-          typeof rawCfg.cwd !== 'string'
-        ) {
-          continue;
-        }
-        const cfg: ServiceConfig = {
-          ...rawCfg,
-          cwd: this.resolveLoadedCwd(rawCfg.cwd)
-        };
-        this.services.set(cfg.id, {
-          config: cfg,
-          runtime: createInitialRuntime(cfg.id),
-          child: null,
-          logs: [],
-          nextLineId: 1,
-          nextErrorBlockId: 1,
-          activeErrorBlockId: null,
-          lastErrorAt: 0,
-          pendingBatch: [],
-          stopRequested: false,
-          readyRegex: compileReadyRegex(cfg.readyPattern),
-          killTimer: null
-        });
+    let list: ServiceConfig[];
+    try {
+      list = this.parseConfigArray(fs.readFileSync(filePath, 'utf8'));
+    } catch (err) {
+      // Never silently start empty: the next save would overwrite the user's file.
+      const reason = err instanceof Error ? err.message : String(err);
+      const backupPath = backupUnreadableFile(filePath);
+      this.configSaveBlocked = backupPath === null;
+      this.storageState.loadWarning = backupPath
+        ? `Could not read ${filePath} (${reason}). A copy was saved to ${backupPath}.`
+        : `Could not read ${filePath} (${reason}). Fix the file before making changes, or they will overwrite it.`;
+      return;
+    }
+
+    for (const rawCfg of list) {
+      if (
+        !rawCfg ||
+        typeof rawCfg.id !== 'string' ||
+        typeof rawCfg.name !== 'string' ||
+        typeof rawCfg.command !== 'string' ||
+        typeof rawCfg.cwd !== 'string'
+      ) {
+        continue;
       }
-    } catch {
-      // Ignore corrupt config file on boot
+      const cfg: ServiceConfig = {
+        ...rawCfg,
+        cwd: this.resolveLoadedCwd(rawCfg.cwd)
+      };
+      this.services.set(cfg.id, createManagedService(cfg));
     }
   }
 
   private saveConfigs(): void {
+    if (this.configSaveBlocked) {
+      this.broadcast(
+        'app:error',
+        'Changes were not saved: the config file could not be read and no backup of it could be made.'
+      );
+      return;
+    }
+
+    // Map order is the display order; keep `order` in step with it so start order matches.
+    let index = 0;
+    for (const svc of this.services.values()) {
+      svc.config = { ...svc.config, order: index };
+      index += 1;
+    }
+
     const configs = Array.from(this.services.values()).map((s) => ({
       ...s.config,
       cwd: this.serializeSavedCwd(s.config.cwd)
     }));
     try {
-      fs.mkdirSync(path.dirname(this.storageState.configFilePath), {
-        recursive: true
-      });
       const content =
         this.storageState.mode === 'workspace'
           ? JSON.stringify({ version: 1, services: configs }, null, 2)
           : JSON.stringify(configs, null, 2);
-      fs.writeFileSync(this.storageState.configFilePath, content, 'utf8');
-    } catch {
-      // Ignore write failure
+      writeFileAtomic(this.storageState.configFilePath, content);
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      this.broadcast(
+        'app:error',
+        `Could not save ${this.storageState.configFilePath}: ${reason}`
+      );
     }
   }
 
@@ -294,7 +357,8 @@ export class ProcessManager {
       mode: 'global',
       workspaceRoot: null,
       configFilePath: this.globalConfigPath,
-      recentWorkspaces: this.storageState.recentWorkspaces
+      recentWorkspaces: this.storageState.recentWorkspaces,
+      loadWarning: null
     };
     this.saveSettings(this.storageState);
     this.loadConfigs();
@@ -328,12 +392,14 @@ export class ProcessManager {
       recentWorkspaces: this.mergeRecentWorkspaces(
         this.storageState.recentWorkspaces,
         resolvedRoot
-      )
+      ),
+      loadWarning: null
     };
     this.saveSettings(this.storageState);
 
     if (createdNewFile) {
       this.services.clear();
+      this.configSaveBlocked = false;
       this.saveConfigs();
     } else {
       this.loadConfigs();
@@ -371,27 +437,17 @@ export class ProcessManager {
       recentWorkspaces: this.mergeRecentWorkspaces(
         this.storageState.recentWorkspaces,
         resolvedRoot
-      )
+      ),
+      loadWarning: null
     };
     this.saveSettings(this.storageState);
 
     this.services.clear();
     for (const cfg of currentServices) {
-      this.services.set(cfg.id, {
-        config: cfg,
-        runtime: createInitialRuntime(cfg.id),
-        child: null,
-        logs: [],
-        nextLineId: 1,
-        nextErrorBlockId: 1,
-        activeErrorBlockId: null,
-        lastErrorAt: 0,
-        pendingBatch: [],
-        stopRequested: false,
-        readyRegex: compileReadyRegex(cfg.readyPattern),
-        killTimer: null
-      });
+      this.services.set(cfg.id, createManagedService(cfg));
     }
+    // The user explicitly chose to write this folder's config, so overwriting is intended.
+    this.configSaveBlocked = false;
     this.saveConfigs();
 
     this.broadcastConfigsChanged();
@@ -437,7 +493,7 @@ export class ProcessManager {
   public getLogs(serviceId: string): LogLine[] {
     const svc = this.services.get(serviceId);
     if (!svc) return [];
-    return svc.logs.slice();
+    return svc.logs.slice(-MAX_LOG_LINES);
   }
 
   public getRunningCount(): number {
@@ -482,20 +538,7 @@ export class ProcessManager {
       return { config: { ...existing.config }, runtime: { ...existing.runtime } };
     }
 
-    const managed: ManagedService = {
-      config,
-      runtime: createInitialRuntime(id),
-      child: null,
-      logs: [],
-      nextLineId: 1,
-      nextErrorBlockId: 1,
-      activeErrorBlockId: null,
-      lastErrorAt: 0,
-      pendingBatch: [],
-      stopRequested: false,
-      readyRegex: compileReadyRegex(config.readyPattern),
-      killTimer: null
-    };
+    const managed = createManagedService(config);
     this.services.set(id, managed);
     this.saveConfigs();
     this.broadcastConfigsChanged();
@@ -562,19 +605,55 @@ export class ProcessManager {
     }
 
     for (const rawCfg of configs) {
-      if (!rawCfg.name || !rawCfg.command || !rawCfg.cwd) continue;
+      if (
+        !rawCfg ||
+        typeof rawCfg.name !== 'string' ||
+        typeof rawCfg.command !== 'string' ||
+        typeof rawCfg.cwd !== 'string' ||
+        !rawCfg.name.trim() ||
+        !rawCfg.command.trim() ||
+        !rawCfg.cwd.trim()
+      ) {
+        continue;
+      }
+      const ports = Array.isArray(rawCfg.ports)
+        ? rawCfg.ports.filter(
+            (p): p is number => Number.isInteger(p) && p > 0 && p < 65536
+          )
+        : undefined;
+      const env =
+        rawCfg.env && typeof rawCfg.env === 'object' && !Array.isArray(rawCfg.env)
+          ? Object.fromEntries(
+              Object.entries(rawCfg.env).map(([k, v]) => [k, String(v)])
+            )
+          : undefined;
       this.upsertService({
         ...rawCfg,
+        ports,
+        env,
+        group: typeof rawCfg.group === 'string' ? rawCfg.group : undefined,
+        readyPattern:
+          typeof rawCfg.readyPattern === 'string' ? rawCfg.readyPattern : undefined,
+        startupDelayMs:
+          typeof rawCfg.startupDelayMs === 'number' ? rawCfg.startupDelayMs : undefined,
+        // Imported entries are appended in file order, after existing services.
+        order: undefined,
         id: replaceAll ? rawCfg.id : undefined
       });
     }
     return this.getSnapshots();
   }
 
-  public exportConfigs(): { version: number; services: ServiceConfig[] } | ServiceConfig[] {
+  /**
+   * @param baseDir Directory the export file is written to. Working directories inside it
+   * are stored relative to it (matching how import resolves them); others stay absolute.
+   */
+  public exportConfigs(
+    baseDir: string
+  ): { version: number; services: ServiceConfig[] } | ServiceConfig[] {
     const list = Array.from(this.services.values()).map((s) => ({
       ...s.config,
-      cwd: this.serializeSavedCwd(s.config.cwd)
+      cwd: relativizeCwd(s.config.cwd, baseDir)
     }));
     return this.storageState.mode === 'workspace'
       ? { version: 1, services: list }
@@ -738,58 +817,64 @@ export class ProcessManager {
     this.broadcastRuntime(svc.runtime);
 
     if (process.platform === 'win32') {
-      const pidsToKill = new Set<number>();
-      for (const p of svc.runtime.childPids) {
-        if (p > 0) pidsToKill.add(p);
-      }
-      if (rootPid && rootPid > 0) {
-        pidsToKill.add(rootPid);
-      }
+      // The root shell PID is safe to kill while Node still holds its handle.
+      const rootAlive = Boolean(
+        childRef && childRef.exitCode === null && childRef.signalCode === null
+      );
+      const knownPids = new Set<number>(
+        svc.runtime.childPids.filter((p) => p > 0)
+      );
+      if (rootPid && rootPid > 0) knownPids.add(rootPid);
+      const ports = [...svc.runtime.detectedPorts];
 
-      // Immediately terminate known PIDs and simultaneously discover any new descendants / listening PIDs
-      const immediateKills = Array.from(pidsToKill)
-        .reverse()
-        .map((targetPid) =>
-          execCommand('taskkill', ['/PID', String(targetPid), '/T', '/F'], 2000)
-        );
-
-      const [liveDescendants, portPids] = await Promise.all([
-        rootPid && rootPid > 0
-          ? this.findDescendantPids(rootPid)
-          : Promise.resolve([]),
-        svc.runtime.detectedPorts.length > 0
-          ? this.findListeningPidsForPorts(svc.runtime.detectedPorts)
-          : Promise.resolve([]),
-        ...immediateKills
+      // Kill the root tree immediately while taking a fresh process snapshot in parallel.
+      const [table, portsByPid] = await Promise.all([
+        this.getProcessTable(),
+        ports.length > 0 ? this.getListeningPortsByPid() : Promise.resolve(null),
+        rootAlive && rootPid
+          ? execCommand('taskkill', ['/PID', String(rootPid), '/T', '/F'], 4000)
+          : Promise.resolve(null)
       ]);
 
+      // Clean up orphans (e.g. a grandchild whose parent already exited). Remembered child
+      // PIDs can be up to one poll old, so only kill a PID if the fresh snapshot shows its
+      // parent is in our tree — a reused PID belonging to something unrelated will not be.
+      // Without a snapshot we only kill the root tree above.
       const extraPids = new Set<number>();
-      for (const p of liveDescendants) {
-        if (p > 0 && !pidsToKill.has(p)) extraPids.add(p);
-      }
-      for (const p of portPids) {
-        if (p > 0 && !pidsToKill.has(p)) extraPids.add(p);
+      if (table) {
+        const tree = new Set<number>(knownPids);
+        if (rootPid && rootPid > 0) {
+          for (const pid of collectDescendants(table, rootPid)) tree.add(pid);
+        }
+        const isInTree = (pid: number) => {
+          const parent = table.parentOf.get(pid);
+          return parent !== undefined && tree.has(parent);
+        };
+        for (const pid of tree) {
+          if (pid !== rootPid && table.parentOf.has(pid) && isInTree(pid)) {
+            extraPids.add(pid);
+          }
+        }
+        if (portsByPid) {
+          for (const [pid, pidPorts] of portsByPid) {
+            if (pid !== rootPid && ports.some((p) => pidPorts.has(p)) && isInTree(pid)) {
+              extraPids.add(pid);
+            }
+          }
+        }
       }
 
       if (extraPids.size > 0) {
         await Promise.all(
-          Array.from(extraPids)
-            .reverse()
-            .map((targetPid) =>
-              execCommand(
-                'taskkill',
-                ['/PID', String(targetPid), '/T', '/F'],
-                2000
-              )
-            )
+          Array.from(extraPids).map((targetPid) =>
+            execCommand('taskkill', ['/PID', String(targetPid), '/T', '/F'], 4000)
+          )
         );
       }
 
-      // Direct Win32 TerminateProcess guarantee for any PID still alive
-      for (const p of [...extraPids, ...pidsToKill]) {
+      if (rootAlive && childRef) {
         try {
-          process.kill(p, 0);
-          process.kill(p, 'SIGKILL');
+          childRef.kill('SIGKILL');
         } catch {
           // Already exited
         }
@@ -878,73 +963,70 @@ export class ProcessManager {
     this.startService(serviceId);
   }
 
-  private async findDescendantPids(rootPid: number): Promise<number[]> {
-    if (process.platform !== 'win32') return [];
-    const procRaw = await execCommand('powershell', [
-      '-NoProfile',
-      '-Command',
-      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
-    ]);
-    if (!procRaw.trim()) return [];
-
-    const childrenByParent = new Map<number, number[]>();
+  /** Snapshot of all Windows processes, or null if it could not be taken (timeout, parse error). */
+  private async getProcessTable(): Promise<ProcessTable | null> {
+    if (process.platform !== 'win32') return null;
+    const raw = await execCommand(
+      'powershell',
+      ['-NoProfile', '-NonInteractive', '-Command', PROCESS_TABLE_PS],
+      PROCESS_TABLE_TIMEOUT_MS
+    );
+    if (!raw || !raw.trim()) return null;
     try {
-      const parsed = JSON.parse(procRaw) as
+      const parsed = JSON.parse(raw) as
         | Array<{ ProcessId: number; ParentProcessId: number }>
         | { ProcessId: number; ParentProcessId: number };
       const list = Array.isArray(parsed) ? parsed : [parsed];
+      const childrenByParent = new Map<number, number[]>();
+      const parentOf = new Map<number, number>();
       for (const item of list) {
-        if (!item) continue;
+        if (
+          !item ||
+          typeof item.ProcessId !== 'number' ||
+          typeof item.ParentProcessId !== 'number'
+        ) {
+          continue;
+        }
+        parentOf.set(item.ProcessId, item.ParentProcessId);
         const arr = childrenByParent.get(item.ParentProcessId) ?? [];
         arr.push(item.ProcessId);
         childrenByParent.set(item.ParentProcessId, arr);
       }
+      return parentOf.size > 0 ? { childrenByParent, parentOf } : null;
     } catch {
-      return [];
+      return null;
     }
-
-    const descendants: number[] = [];
-    const queue = [rootPid];
-    const visited = new Set<number>([rootPid]);
-    while (queue.length > 0) {
-      const current = queue.shift()!;
-      for (const kid of childrenByParent.get(current) ?? []) {
-        if (!visited.has(kid)) {
-          visited.add(kid);
-          descendants.push(kid);
-          queue.push(kid);
-        }
-      }
-    }
-    return descendants;
   }
 
-  private async findListeningPidsForPorts(ports: number[]): Promise<number[]> {
-    if (process.platform !== 'win32' || ports.length === 0) return [];
-    const portSet = new Set(ports);
-    const netstatOut = await execCommand('netstat', ['-ano', '-p', 'TCP']);
-    const pids = new Set<number>();
-    for (const line of netstatOut.split(/\r?\n/)) {
+  /** Listening TCP ports (IPv4 and IPv6) per PID, or null if netstat failed. */
+  private async getListeningPortsByPid(): Promise<Map<number, Set<number>> | null> {
+    if (process.platform !== 'win32') return null;
+    const out = await execCommand('netstat', ['-ano']);
+    if (out === null) return null;
+    const portsByPid = new Map<number, Set<number>>();
+    for (const line of out.split(/\r?\n/)) {
       if (!line.includes('LISTENING')) continue;
       const parts = line.trim().split(/\s+/);
-      if (parts.length < 5) continue;
+      if (parts.length < 5 || !parts[0].toUpperCase().startsWith('TCP')) continue;
       const localAddr = parts[1];
       const pid = Number.parseInt(parts[4], 10);
       if (!Number.isFinite(pid) || pid <= 0) continue;
       const colonIdx = localAddr.lastIndexOf(':');
       if (colonIdx === -1) continue;
-      const addrPort = Number.parseInt(localAddr.slice(colonIdx + 1), 10);
-      if (portSet.has(addrPort)) {
-        pids.add(pid);
-      }
+      const port = Number.parseInt(localAddr.slice(colonIdx + 1), 10);
+      if (!Number.isFinite(port)) continue;
+      const set = portsByPid.get(pid) ?? new Set<number>();
+      set.add(port);
+      portsByPid.set(pid, set);
     }
-    return Array.from(pids);
+    return portsByPid;
   }
 
   public async startGroup(groupName: string): Promise<void> {
-    const items = Array.from(this.services.values())
-      .filter((s) => s.config.group === groupName)
-      .sort((a, b) => (a.config.order ?? 0) - (b.config.order ?? 0));
+    // Map order is the order shown in the sidebar.
+    const items = Array.from(this.services.values()).filter(
+      (s) => s.config.group === groupName
+    );
 
     for (const item of items) {
       this.startService(item.config.id);
@@ -962,9 +1044,8 @@ export class ProcessManager {
   }
 
   public async startAll(): Promise<void> {
-    const items = Array.from(this.services.values()).sort(
-      (a, b) => (a.config.order ?? 0) - (b.config.order ?? 0)
-    );
+    // Map order is the order shown in the sidebar.
+    const items = Array.from(this.services.values());
     for (const item of items) {
       this.startService(item.config.id);
       if (item.config.startupDelayMs && item.config.startupDelayMs > 0) {
@@ -980,27 +1061,21 @@ export class ProcessManager {
 
   public async killPort(port: number): Promise<{ killedPids: number[] }> {
     if (process.platform !== 'win32') return { killedPids: [] };
-    const netstatOut = await execCommand('netstat', ['-ano', '-p', 'TCP']);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      return { killedPids: [] };
+    }
+    const portsByPid = await this.getListeningPortsByPid();
     const pids = new Set<number>();
-    for (const line of netstatOut.split(/\r?\n/)) {
-      if (!line.includes('LISTENING')) continue;
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 5) continue;
-      const localAddr = parts[1];
-      const pid = Number.parseInt(parts[4], 10);
-      if (!Number.isFinite(pid) || pid <= 0) continue;
-      const colonIdx = localAddr.lastIndexOf(':');
-      if (colonIdx === -1) continue;
-      const addrPort = Number.parseInt(localAddr.slice(colonIdx + 1), 10);
-      if (addrPort === port) {
-        pids.add(pid);
-      }
+    for (const [pid, ports] of portsByPid ?? []) {
+      // Never target the System process or this app itself.
+      if (pid <= 4 || pid === process.pid) continue;
+      if (ports.has(port)) pids.add(pid);
     }
 
     const killedPids: number[] = [];
     for (const pid of pids) {
-      await execCommand('taskkill', ['/PID', String(pid), '/T', '/F']);
-      killedPids.push(pid);
+      const result = await execCommand('taskkill', ['/PID', String(pid), '/T', '/F']);
+      if (result !== null) killedPids.push(pid);
     }
     return { killedPids };
   }
@@ -1012,9 +1087,11 @@ export class ProcessManager {
   ): void {
     if (!stream) return;
     let remainder = '';
+    // Decode as a stream so multi-byte UTF-8 characters split across chunks stay intact.
+    stream.setEncoding('utf8');
 
-    stream.on('data', (chunk: Buffer | string) => {
-      const text = remainder + chunk.toString('utf8');
+    stream.on('data', (chunk: string) => {
+      const text = remainder + chunk;
       const parts = text.split(/\r\n|\n|\r/);
       remainder = parts.pop() ?? '';
 
@@ -1096,6 +1173,7 @@ export class ProcessManager {
 
     const line: LogLine = {
       id: svc.nextLineId++,
+      seq: nextGlobalLineSeq++,
       serviceId: svc.config.id,
       timestamp: now,
       stream,
@@ -1107,7 +1185,7 @@ export class ProcessManager {
     };
 
     svc.logs.push(line);
-    if (svc.logs.length > MAX_LOG_LINES) {
+    if (svc.logs.length > MAX_LOG_LINES + LOG_TRIM_CHUNK) {
       svc.logs.splice(0, svc.logs.length - MAX_LOG_LINES);
     }
     svc.runtime.lineCount = svc.logs.length;
@@ -1149,81 +1227,30 @@ export class ProcessManager {
     this.pollInFlight = true;
 
     try {
-      const [procRaw, netstatRaw] = await Promise.all([
-        execCommand('powershell', [
-          '-NoProfile',
-          '-Command',
-          'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
-        ]),
-        execCommand('netstat', ['-ano', '-p', 'TCP'])
+      const [table, portsByPid] = await Promise.all([
+        this.getProcessTable(),
+        this.getListeningPortsByPid()
       ]);
-
-      // Build parent -> children map
-      const childrenByParent = new Map<number, number[]>();
-      if (procRaw.trim()) {
-        try {
-          const parsed = JSON.parse(procRaw) as
-            | Array<{ ProcessId: number; ParentProcessId: number }>
-            | { ProcessId: number; ParentProcessId: number };
-          const list = Array.isArray(parsed) ? parsed : [parsed];
-          for (const item of list) {
-            if (!item) continue;
-            const arr = childrenByParent.get(item.ParentProcessId) ?? [];
-            arr.push(item.ProcessId);
-            childrenByParent.set(item.ParentProcessId, arr);
-          }
-        } catch {
-          // Ignore parse glitch
-        }
-      }
-
-      // Build pid -> listening ports map
-      const portsByPid = new Map<number, Set<number>>();
-      for (const line of netstatRaw.split(/\r?\n/)) {
-        if (!line.includes('LISTENING')) continue;
-        const parts = line.trim().split(/\s+/);
-        if (parts.length < 5) continue;
-        const localAddr = parts[1];
-        const pid = Number.parseInt(parts[4], 10);
-        if (!Number.isFinite(pid) || pid <= 0) continue;
-        const colonIdx = localAddr.lastIndexOf(':');
-        if (colonIdx === -1) continue;
-        const port = Number.parseInt(localAddr.slice(colonIdx + 1), 10);
-        if (!Number.isFinite(port)) continue;
-        const set = portsByPid.get(pid) ?? new Set<number>();
-        set.add(port);
-        portsByPid.set(pid, set);
-      }
 
       for (const svc of activeServices) {
         if (svc.stopRequested || !svc.child) continue;
         const rootPid = svc.runtime.pid;
         if (!rootPid) continue;
 
-        const descendants: number[] = [];
-        const queue = [rootPid];
-        const visited = new Set<number>([rootPid]);
+        // If a snapshot failed (e.g. PowerShell timed out), keep the previous values
+        // rather than treating the failure as "no children / no ports".
+        const descendants = table
+          ? collectDescendants(table, rootPid)
+          : svc.runtime.childPids;
 
-        while (queue.length > 0) {
-          const current = queue.shift()!;
-          const kids = childrenByParent.get(current) ?? [];
-          for (const kid of kids) {
-            if (!visited.has(kid)) {
-              visited.add(kid);
-              descendants.push(kid);
-              queue.push(kid);
-            }
+        let detectedPorts = svc.runtime.detectedPorts;
+        if (portsByPid) {
+          const portSet = new Set<number>();
+          for (const pid of [rootPid, ...descendants]) {
+            for (const port of portsByPid.get(pid) ?? []) portSet.add(port);
           }
+          detectedPorts = Array.from(portSet).sort((a, b) => a - b);
         }
-
-        const portSet = new Set<number>();
-        for (const pid of visited) {
-          const p = portsByPid.get(pid);
-          if (p) {
-            for (const port of p) portSet.add(port);
-          }
-        }
-        const detectedPorts = Array.from(portSet).sort((a, b) => a - b);
 
         const pidsChanged =
           descendants.join(',') !== svc.runtime.childPids.join(',');
@@ -1294,18 +1321,19 @@ export function normalizeShellCommand(command: string): string {
   return combined;
 }
 
+/** Run a command and resolve with its stdout, or null if it failed, timed out or exited non-zero. */
 function execCommand(
   cmd: string,
   args: string[],
   timeoutMs = 2500
-): Promise<string> {
+): Promise<string | null> {
   return new Promise((resolve) => {
     execFile(
       cmd,
       args,
-      { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
-      (_err, stdout) => {
-        resolve(stdout || '');
+      { windowsHide: true, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        resolve(err ? null : stdout || '');
       }
     );
   });

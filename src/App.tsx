@@ -45,6 +45,29 @@ import {
 
 const MAX_RENDERER_LINES = 25_000;
 
+function capLines(lines: LogLine[]): LogLine[] {
+  return lines.length > MAX_RENDERER_LINES
+    ? lines.slice(lines.length - MAX_RENDERER_LINES)
+    : lines;
+}
+
+/** Append live lines, skipping any already present (lines are ordered by `seq`). */
+function appendLogLines(existing: LogLine[], incoming: LogLine[]): LogLine[] {
+  const lastSeq = existing.length > 0 ? existing[existing.length - 1].seq : 0;
+  let start = 0;
+  while (start < incoming.length && incoming[start].seq <= lastSeq) start += 1;
+  if (start === incoming.length) return existing;
+  return capLines(existing.concat(start === 0 ? incoming : incoming.slice(start)));
+}
+
+/**
+ * Combine a fetched history snapshot with lines that arrived live while it was in flight.
+ * The history is authoritative up to its last line; live lines after that are kept.
+ */
+function mergeHistory(history: LogLine[], live: LogLine[]): LogLine[] {
+  return appendLogLines(capLines(history), live);
+}
+
 interface ToastState {
   kind: 'success' | 'error';
   message: string;
@@ -98,9 +121,13 @@ export const App: React.FC = () => {
       if (toastTimerRef.current) {
         window.clearTimeout(toastTimerRef.current);
       }
-      toastTimerRef.current = window.setTimeout(() => {
-        setToast(null);
-      }, 2800);
+      // Errors stay up longer so there is time to read file paths in them.
+      toastTimerRef.current = window.setTimeout(
+        () => {
+          setToast(null);
+        },
+        kind === 'error' ? 8000 : 2800
+      );
     },
     []
   );
@@ -175,10 +202,13 @@ export const App: React.FC = () => {
       setSelectedServiceId(initialId);
 
       if (initialId) {
+        fetchedLogIdsRef.current.add(initialId);
         const initialLogs = await window.serviceConsole.getLogs(initialId);
         if (!mounted) return;
-        fetchedLogIdsRef.current.add(initialId);
-        setLogsByService((prev) => ({ ...prev, [initialId]: initialLogs }));
+        setLogsByService((prev) => ({
+          ...prev,
+          [initialId]: mergeHistory(initialLogs, prev[initialId] ?? [])
+        }));
       }
     });
 
@@ -205,17 +235,17 @@ export const App: React.FC = () => {
     const offLogBatch = window.serviceConsole.onLogBatch((batch) => {
       setLogsByService((prev) => {
         const existing = prev[batch.serviceId] ?? [];
-        const combined = existing.concat(batch.lines);
-        const trimmed =
-          combined.length > MAX_RENDERER_LINES
-            ? combined.slice(combined.length - MAX_RENDERER_LINES)
-            : combined;
-        return { ...prev, [batch.serviceId]: trimmed };
+        const next = appendLogLines(existing, batch.lines);
+        return next === existing ? prev : { ...prev, [batch.serviceId]: next };
       });
     });
 
     const offCleared = window.serviceConsole.onLogCleared(({ serviceId }) => {
       setLogsByService((prev) => ({ ...prev, [serviceId]: [] }));
+    });
+
+    const offAppError = window.serviceConsole.onAppError((message) => {
+      showToast(message, 'error');
     });
 
     return () => {
@@ -225,8 +255,14 @@ export const App: React.FC = () => {
       offRuntime();
       offLogBatch();
       offCleared();
+      offAppError();
     };
-  }, []);
+  }, [showToast]);
+
+  // Tell the user when their config file could not be read (a backup was made).
+  useEffect(() => {
+    if (storage?.loadWarning) showToast(storage.loadWarning, 'error');
+  }, [storage?.loadWarning, showToast]);
 
   // Close workspace dropdown when clicking outside
   useEffect(() => {
@@ -248,8 +284,16 @@ export const App: React.FC = () => {
     setSelectedServiceId(id);
     if (!fetchedLogIdsRef.current.has(id)) {
       fetchedLogIdsRef.current.add(id);
-      const history = await window.serviceConsole.getLogs(id);
-      setLogsByService((prev) => ({ ...prev, [id]: history }));
+      try {
+        const history = await window.serviceConsole.getLogs(id);
+        setLogsByService((prev) => ({
+          ...prev,
+          [id]: mergeHistory(history, prev[id] ?? [])
+        }));
+      } catch {
+        // Allow a retry next time the service is selected
+        fetchedLogIdsRef.current.delete(id);
+      }
     }
   }, []);
 
@@ -300,6 +344,12 @@ export const App: React.FC = () => {
       }
       await window.serviceConsole.deleteService(id);
       fetchedLogIdsRef.current.delete(id);
+      setLogsByService((prev) => {
+        if (!(id in prev)) return prev;
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       showToast(`Removed ${target.config.name}`);
       return true;
     },
