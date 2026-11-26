@@ -2,12 +2,18 @@
   "name": "multi-service-console",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "IntelliJ-style multi-service process launcher and console log viewer built with Electron, React, and TypeScript",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/venkatsalem/multi-service-console.git"
+  },
   "main": "dist-electron/electron/main.js",
   "scripts": {
     "dev": "concurrently -k \"vite\" \"wait-on tcp:5174 && tsc -p tsconfig.electron.json && electron .\"",
     "build": "tsc -p tsconfig.json && vite build && tsc -p tsconfig.electron.json",
     "package": "npm run build && node scripts/package.mjs",
+    "shortcut": "node scripts/create-shortcut.mjs",
     "start": "npm run build && electron ."
   },
   "dependencies": {

@@ -601,13 +601,60 @@ textarea {
 }
 
 .service-card {
+  position: relative;
   padding: 8px 10px;
   margin-bottom: 5px;
   border-radius: 7px;
   border: 1px solid var(--border);
+  border-left: 3px solid transparent;
   background: var(--bg-root);
   cursor: pointer;
-  transition: background 0.12s, border-color 0.12s;
+  transition:
+    background 0.14s,
+    border-color 0.14s,
+    opacity 0.14s,
+    box-shadow 0.14s;
+}
+
+.service-card.status-stopped {
+  opacity: 0.66;
+  background: var(--bg-subbar);
+}
+
+.service-card.status-stopped:hover {
+  opacity: 0.94;
+  background: var(--bg-hover);
+}
+
+.service-card.status-stopped.selected {
+  opacity: 1;
+}
+
+.service-card.status-running {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--green) 38%, var(--border));
+  border-left: 3px solid var(--green);
+  background: color-mix(in srgb, var(--green) 6%, var(--bg-root));
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+}
+
+.service-card.status-running:hover {
+  background: color-mix(in srgb, var(--green) 10%, var(--bg-root));
+}
+
+.service-card.status-starting,
+.service-card.status-stopping {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--border));
+  border-left: 3px solid var(--amber);
+  background: color-mix(in srgb, var(--amber) 6%, var(--bg-root));
+}
+
+.service-card.status-crashed {
+  opacity: 1;
+  border-color: color-mix(in srgb, var(--red) 40%, var(--border));
+  border-left: 3px solid var(--red);
+  background: color-mix(in srgb, var(--red) 6%, var(--bg-root));
 }
 
 .service-card:hover {
@@ -617,6 +664,45 @@ textarea {
 .service-card.selected {
   background: var(--bg-selected);
   border-color: var(--accent);
+}
+
+.service-card.status-running.selected {
+  border-left-color: var(--green);
+}
+
+.service-card.status-starting.selected,
+.service-card.status-stopping.selected {
+  border-left-color: var(--amber);
+}
+
+.service-card.status-crashed.selected {
+  border-left-color: var(--red);
+}
+
+.service-card.dragging {
+  opacity: 0.45;
+}
+
+.service-card.drop-before {
+  box-shadow: inset 0 2px 0 0 var(--accent);
+}
+
+.service-card.drop-after {
+  box-shadow: inset 0 -2px 0 0 var(--accent);
+}
+
+.drag-handle {
+  display: inline-flex;
+  align-items: center;
+  color: var(--text-muted);
+  cursor: grab;
+  flex-shrink: 0;
+  opacity: 0.55;
+  margin-left: -3px;
+}
+
+.service-card:hover .drag-handle {
+  opacity: 1;
 }
 
 .service-card-top {
@@ -775,8 +861,114 @@ textarea {
 .service-row-actions {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 5px;
   flex-shrink: 0;
+}
+
+.row-run-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.12s, transform 0.08s;
+}
+
+.row-run-btn:active {
+  transform: scale(0.95);
+}
+
+.row-run-btn.is-start {
+  background: var(--green-bg);
+  color: var(--green);
+}
+
+.row-run-btn.is-start:hover {
+  background: var(--green);
+  color: #ffffff;
+}
+
+.row-run-btn.is-stop {
+  background: var(--red-bg);
+  color: var(--red);
+}
+
+.row-run-btn.is-stop:hover {
+  background: var(--red);
+  color: #ffffff;
+}
+
+.row-restart-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.row-restart-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+/* Right-Click Context Menu */
+.context-menu {
+  position: fixed;
+  min-width: 185px;
+  padding: 5px;
+  border-radius: 8px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.3);
+  z-index: 90;
+}
+
+.context-menu-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border: none;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu-item:hover:not(:disabled) {
+  background: var(--bg-selected);
+}
+
+.context-menu-item:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.context-menu-label {
+  flex: 1;
+}
+
+.context-menu-shortcut {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-left: 12px;
+}
+
+.context-menu-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
 }
 
 /* Console Pane */
@@ -1134,12 +1326,20 @@ textarea {
   padding-top: 1px;
 }
 
+.log-line-num::before {
+  content: attr(data-line);
+}
+
 .log-time {
   flex-shrink: 0;
   color: var(--text-muted);
   user-select: none;
   font-size: 11px;
   padding-top: 1px;
+}
+
+.log-time::before {
+  content: attr(data-time);
 }
 
 .log-content {
@@ -1152,27 +1352,6 @@ textarea {
   color: inherit;
   border-radius: 2px;
   padding: 0 1px;
-}
-
-.inline-copy-err-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 1px 7px;
-  border-radius: 4px;
-  border: 1px solid var(--red);
-  background: var(--bg-root);
-  color: var(--red);
-  font-size: 10.5px;
-  font-weight: 600;
-  cursor: pointer;
-  flex-shrink: 0;
-  user-select: none;
-}
-
-.inline-copy-err-btn:hover {
-  background: var(--red);
-  color: #ffffff;
 }
 
 .jump-bottom-pill {
@@ -1211,7 +1390,7 @@ textarea {
 
 .modal-card {
   width: 100%;
-  max-width: 580px;
+  max-width: 640px;
   max-height: 90vh;
   display: flex;
   flex-direction: column;
@@ -1289,6 +1468,13 @@ textarea {
   border-color: var(--accent);
 }
 
+.command-textarea {
+  min-height: 112px;
+  font-size: 13px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
 .input-with-btn {
   display: flex;
   gap: 8px;
@@ -1311,6 +1497,29 @@ textarea {
   justify-content: flex-end;
   gap: 8px;
   padding-top: 6px;
+}
+
+.modal-footer-split {
+  justify-content: space-between;
+  align-items: center;
+}
+
+.modal-footer-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.btn-danger-outline {
+  background: transparent;
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: var(--red);
+  color: #ffffff;
+  border-color: var(--red);
 }
 
 .scan-list-header {

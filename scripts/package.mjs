@@ -14,6 +14,7 @@ async function main() {
     out: path.join(rootDir, 'release'),
     overwrite: true,
     prune: false,
+    icon: path.join(rootDir, 'assets', 'icon.ico'),
     win32metadata: {
       CompanyName: 'Venkat Apps',
       FileDescription: 'Multi-Service Console',

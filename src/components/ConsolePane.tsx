@@ -102,7 +102,7 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
   const [scrollLocked, setScrollLocked] = useState(false);
   const [userScrolledUp, setUserScrolledUp] = useState(false);
   const [wrapLines, setWrapLines] = useState(true);
-  const [showTimestamps, setShowTimestamps] = useState(true);
+  const [showTimestamps, setShowTimestamps] = useState(false);
   const [levelFilter, setLevelFilter] = useState<LevelFilter>('all');
 
   const [searchOpen, setSearchOpen] = useState(false);
@@ -114,9 +114,17 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    selectedText: string;
+    selectedLines: string[];
+    clickedLine: LogLine | null;
+  } | null>(null);
 
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
   const lastLogCountRef = useRef(0);
 
   const serviceId = snapshot?.config.id ?? null;
@@ -134,8 +142,30 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
     setUserScrolledUp(false);
     setScrollLocked(false);
     setActiveMatchIdx(0);
+    setContextMenu(null);
     lastLogCountRef.current = 0;
   }, [serviceId]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        contextMenuRef.current &&
+        !contextMenuRef.current.contains(e.target as Node)
+      ) {
+        setContextMenu(null);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [contextMenu]);
 
   // Ctrl+F / Cmd+F opens & focuses search
   useEffect(() => {
@@ -801,6 +831,61 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
           ref={scrollContainerRef}
           className={`console-viewport ${wrapLines ? 'wrap-on' : 'wrap-off'}`}
           onScroll={handleScroll}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            const sel = window.getSelection();
+            const selectedText = sel?.toString() ?? '';
+            const rowEl = (e.target as HTMLElement | null)?.closest(
+              '[data-index]'
+            );
+            const rowIdx = rowEl
+              ? Number.parseInt(rowEl.getAttribute('data-index') ?? '', 10)
+              : Number.NaN;
+            const clickedLine =
+              Number.isFinite(rowIdx) && filteredLogs[rowIdx]
+                ? filteredLogs[rowIdx]
+                : null;
+
+            let selectedLines: string[] = clickedLine ? [clickedLine.raw] : [];
+            if (sel && sel.rangeCount > 0 && !sel.isCollapsed) {
+              const range = sel.getRangeAt(0);
+              const getRowIndexFromNode = (node: Node): number | null => {
+                const el =
+                  node instanceof Element ? node : node.parentElement;
+                const row = el?.closest('[data-index]');
+                if (!row) return null;
+                const idx = Number.parseInt(
+                  row.getAttribute('data-index') ?? '',
+                  10
+                );
+                return Number.isFinite(idx) ? idx : null;
+              };
+              const startIdx = getRowIndexFromNode(range.startContainer);
+              const endIdx = getRowIndexFromNode(range.endContainer);
+              if (startIdx !== null && endIdx !== null) {
+                const minIdx = Math.max(0, Math.min(startIdx, endIdx));
+                const maxIdx = Math.min(
+                  filteredLogs.length - 1,
+                  Math.max(startIdx, endIdx)
+                );
+                selectedLines = filteredLogs
+                  .slice(minIdx, maxIdx + 1)
+                  .map((l) => l.raw);
+              }
+            }
+
+            const menuWidth = 220;
+            const menuHeight = 220;
+            const x = Math.min(e.clientX, window.innerWidth - menuWidth - 8);
+            const y = Math.min(e.clientY, window.innerHeight - menuHeight - 8);
+            setContextMenu({
+              x,
+              y,
+              selectedText,
+              selectedLines,
+              clickedLine
+            });
+          }}
         >
           {filteredLogs.length === 0 ? (
             <div className="console-placeholder">
@@ -834,30 +919,16 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
                     }}
                     className={`log-row level-${line.level} ${isActiveMatch ? 'active-match-row' : ''}`}
                   >
-                    <span className="log-line-num">{line.id}</span>
+                    <span className="log-line-num" data-line={line.id} />
                     {showTimestamps && (
-                      <span className="log-time">
-                        {formatTime(line.timestamp)}
-                      </span>
+                      <span
+                        className="log-time"
+                        data-time={formatTime(line.timestamp)}
+                      />
                     )}
                     <span className="log-content">
                       {renderHighlightedSpans(line, searchRegex)}
                     </span>
-                    {line.isErrorStart && line.errorBlockId !== undefined && (
-                      <button
-                        type="button"
-                        className="inline-copy-err-btn"
-                        title="Copy this error and its stack trace"
-                        onClick={() => copyErrorBlock(line.errorBlockId!)}
-                      >
-                        {copiedId === `block-${line.errorBlockId}` ? (
-                          <Check size={11} />
-                        ) : (
-                          <Copy size={11} />
-                        )}
-                        Copy Error
-                      </button>
-                    )}
                   </div>
                 );
               })}
@@ -874,6 +945,99 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
             <ArrowDownToLine size={13} />
             {scrollLocked ? 'Scroll Locked — Resume' : 'Jump to Bottom'}
           </button>
+        )}
+
+        {contextMenu && (
+          <div
+            ref={contextMenuRef}
+            className="context-menu"
+            style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+            onMouseDown={(e) => e.preventDefault()}
+          >
+            <button
+              type="button"
+              className="context-menu-item"
+              disabled={!contextMenu.selectedText}
+              onClick={() => {
+                const text = contextMenu.selectedText;
+                setContextMenu(null);
+                if (text) onCopyText(text, 'selected text');
+              }}
+            >
+              <Copy size={14} />
+              <span className="context-menu-label">Copy</span>
+              <span className="context-menu-shortcut">Ctrl+C</span>
+            </button>
+
+            {contextMenu.selectedLines.length > 0 && (
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  const lines = contextMenu.selectedLines;
+                  setContextMenu(null);
+                  onCopyText(
+                    lines.join('\n'),
+                    lines.length === 1 ? 'line' : `${lines.length} lines`
+                  );
+                }}
+              >
+                <Copy size={14} />
+                <span className="context-menu-label">
+                  {contextMenu.selectedLines.length > 1
+                    ? `Copy Lines (${contextMenu.selectedLines.length})`
+                    : 'Copy Lines'}
+                </span>
+              </button>
+            )}
+
+            {contextMenu.clickedLine?.errorBlockId !== undefined && (
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  const blockId = contextMenu.clickedLine!.errorBlockId!;
+                  setContextMenu(null);
+                  copyErrorBlock(blockId);
+                }}
+              >
+                <AlertTriangle size={14} />
+                <span className="context-menu-label">Copy Error Block</span>
+              </button>
+            )}
+
+            <div className="context-menu-divider" />
+
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={() => {
+                setContextMenu(null);
+                setSearchOpen(true);
+                requestAnimationFrame(() => {
+                  searchInputRef.current?.focus();
+                  searchInputRef.current?.select();
+                });
+              }}
+            >
+              <Search size={14} />
+              <span className="context-menu-label">Find in Console</span>
+              <span className="context-menu-shortcut">Ctrl+F</span>
+            </button>
+
+            <button
+              type="button"
+              className="context-menu-item"
+              disabled={logs.length === 0}
+              onClick={() => {
+                setContextMenu(null);
+                onClear(config.id);
+              }}
+            >
+              <Trash2 size={14} />
+              <span className="context-menu-label">Clear Console</span>
+            </button>
+          </div>
         )}
       </div>
     </main>

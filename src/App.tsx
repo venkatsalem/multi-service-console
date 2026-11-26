@@ -246,19 +246,20 @@ export const App: React.FC = () => {
   );
 
   const handleDeleteService = useCallback(
-    async (id: string) => {
+    async (id: string): Promise<boolean> => {
       const target = services.find((s) => s.config.id === id);
-      if (!target) return;
+      if (!target) return false;
       if (
         !window.confirm(
           `Remove "${target.config.name}" from configured processes?`
         )
       ) {
-        return;
+        return false;
       }
       await window.serviceConsole.deleteService(id);
       fetchedLogIdsRef.current.delete(id);
       showToast(`Removed ${target.config.name}`);
+      return true;
     },
     [services, showToast]
   );
@@ -703,8 +704,8 @@ export const App: React.FC = () => {
                 onStartService={(id) =>
                   void window.serviceConsole.startService(id)
                 }
-                onStopService={(id) =>
-                  void window.serviceConsole.stopService(id, false)
+                onStopService={(id, force) =>
+                  void window.serviceConsole.stopService(id, force)
                 }
                 onRestartService={(id) =>
                   void window.serviceConsole.restartService(id)
@@ -712,7 +713,28 @@ export const App: React.FC = () => {
                 onEditService={(cfg) =>
                   setFormModalState({ open: true, editing: cfg })
                 }
-                onDeleteService={(id) => void handleDeleteService(id)}
+                onPopoutService={(id, name) =>
+                  void window.serviceConsole.openPopout(id, name)
+                }
+                onShowInExplorer={async (cwd) => {
+                  const res = await window.serviceConsole.showInExplorer(cwd);
+                  if (!res.ok) {
+                    showToast(res.error || 'Failed to open Explorer', 'error');
+                  }
+                }}
+                onOpenTerminal={async (cwd) => {
+                  const res = await window.serviceConsole.openTerminal(cwd);
+                  if (!res.ok) {
+                    showToast(res.error || 'Failed to open Terminal', 'error');
+                  }
+                }}
+                onReorderService={(draggedId, targetId, position) =>
+                  void window.serviceConsole.reorderService(
+                    draggedId,
+                    targetId,
+                    position
+                  )
+                }
                 onStartGroup={(group) =>
                   void window.serviceConsole.startGroup(group)
                 }
@@ -754,6 +776,12 @@ export const App: React.FC = () => {
           defaultCwd={storage?.workspaceRoot ?? ''}
           existingGroups={existingGroups}
           onClose={() => setFormModalState({ open: false, editing: null })}
+          onDelete={async (id) => {
+            const removed = await handleDeleteService(id);
+            if (removed) {
+              setFormModalState({ open: false, editing: null });
+            }
+          }}
           onSave={async (data) => {
             const snap = await window.serviceConsole.upsertService(data);
             setSelectedServiceId(snap.config.id);

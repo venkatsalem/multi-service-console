@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { FolderOpen, X } from 'lucide-react';
+import { FolderOpen, Trash2, X } from 'lucide-react';
 import { ServiceConfig, ServiceType } from '../../shared/types';
 
 interface ServiceFormModalProps {
@@ -7,6 +7,7 @@ interface ServiceFormModalProps {
   defaultCwd?: string;
   existingGroups: string[];
   onClose: () => void;
+  onDelete?: (id: string) => Promise<void> | void;
   onSave: (
     data: Partial<ServiceConfig> & {
       name: string;
@@ -51,6 +52,7 @@ export const ServiceFormModal: React.FC<ServiceFormModalProps> = ({
   defaultCwd = '',
   existingGroups,
   onClose,
+  onDelete,
   onSave
 }) => {
   const [name, setName] = useState(initial?.name ?? '');
@@ -221,12 +223,23 @@ export const ServiceFormModal: React.FC<ServiceFormModalProps> = ({
           </label>
 
           <label className="form-field">
-            <span>Command *</span>
+            <span>Command * (multiple lines auto-chain with &amp;&amp;)</span>
             <textarea
-              rows={2}
+              rows={5}
               value={command}
               onChange={(e) => setCommand(e.target.value)}
-              placeholder="e.g. mvn spring-boot:run  or  npm run dev"
+              placeholder={'mvn compile\nmvn spring-boot:run'}
+              className="mono-input command-textarea"
+            />
+          </label>
+
+          <label className="form-field">
+            <span>Environment Variables (KEY=VALUE per line, optional)</span>
+            <textarea
+              rows={3}
+              value={envText}
+              onChange={(e) => setEnvText(e.target.value)}
+              placeholder={'SPRING_PROFILES_ACTIVE=local\nSERVER_PORT=8081'}
               className="mono-input"
             />
           </label>
@@ -256,32 +269,50 @@ export const ServiceFormModal: React.FC<ServiceFormModalProps> = ({
             </label>
           </div>
 
-          <label className="form-field">
-            <span>Environment Variables (KEY=VALUE per line, optional)</span>
-            <textarea
-              rows={3}
-              value={envText}
-              onChange={(e) => setEnvText(e.target.value)}
-              placeholder={'SPRING_PROFILES_ACTIVE=local\nSERVER_PORT=8081'}
-              className="mono-input"
-            />
-          </label>
-
-          <div className="modal-footer">
-            <button
-              type="button"
-              className="btn btn-secondary"
-              onClick={onClose}
-            >
-              Cancel
-            </button>
-            <button
-              type="submit"
-              className="btn btn-primary"
-              disabled={saving}
-            >
-              {saving ? 'Saving...' : initial ? 'Save Changes' : 'Add Process'}
-            </button>
+          <div className="modal-footer modal-footer-split">
+            <div>
+              {initial && onDelete && (
+                <button
+                  type="button"
+                  className="btn btn-danger-outline"
+                  disabled={saving}
+                  onClick={async () => {
+                    setSaving(true);
+                    try {
+                      const deleted = await Promise.resolve(
+                        onDelete(initial.id)
+                      );
+                      void deleted;
+                    } finally {
+                      setSaving(false);
+                    }
+                  }}
+                >
+                  <Trash2 size={14} />
+                  Delete Process
+                </button>
+              )}
+            </div>
+            <div className="modal-footer-right">
+              <button
+                type="button"
+                className="btn btn-secondary"
+                onClick={onClose}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                className="btn btn-primary"
+                disabled={saving}
+              >
+                {saving
+                  ? 'Saving...'
+                  : initial
+                    ? 'Save Changes'
+                    : 'Add Process'}
+              </button>
+            </div>
           </div>
         </form>
       </div>

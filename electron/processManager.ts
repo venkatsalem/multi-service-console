@@ -513,6 +513,45 @@ export class ProcessManager {
     this.broadcastConfigsChanged();
   }
 
+  public reorderService(
+    draggedId: string,
+    targetId: string,
+    position: 'before' | 'after'
+  ): ServiceSnapshot[] {
+    if (draggedId === targetId) return this.getSnapshots();
+    const entries = Array.from(this.services.entries());
+    const fromIndex = entries.findIndex(([id]) => id === draggedId);
+    const targetInitialIndex = entries.findIndex(([id]) => id === targetId);
+    if (fromIndex === -1 || targetInitialIndex === -1) {
+      return this.getSnapshots();
+    }
+
+    const [draggedEntry] = entries.splice(fromIndex, 1);
+    const targetNewIndex = entries.findIndex(([id]) => id === targetId);
+    if (targetNewIndex === -1) return this.getSnapshots();
+
+    const targetGroup = entries[targetNewIndex][1].config.group;
+    draggedEntry[1].config = {
+      ...draggedEntry[1].config,
+      group: targetGroup
+    };
+
+    const insertIndex =
+      position === 'before' ? targetNewIndex : targetNewIndex + 1;
+    entries.splice(insertIndex, 0, draggedEntry);
+
+    this.services = new Map(
+      entries.map(([id, managed], idx) => {
+        managed.config = { ...managed.config, order: idx };
+        return [id, managed];
+      })
+    );
+
+    this.saveConfigs();
+    this.broadcastConfigsChanged();
+    return this.getSnapshots();
+  }
+
   public importConfigs(configs: ServiceConfig[], replaceAll = false): ServiceSnapshot[] {
     if (replaceAll) {
       for (const [id, svc] of this.services) {
@@ -592,9 +631,11 @@ export class ProcessManager {
     svc.runtime.childPids = [];
     svc.runtime.detectedPorts = [];
 
+    const resolvedCommand = normalizeShellCommand(config.command);
+
     this.appendSystemLine(
       svc,
-      `[multi-service-console] Starting "${config.name}" in ${config.cwd}\n> ${config.command}`
+      `[multi-service-console] Starting "${config.name}" in ${config.cwd}\n> ${resolvedCommand}`
     );
 
     const mergedEnv: NodeJS.ProcessEnv = {
@@ -603,7 +644,7 @@ export class ProcessManager {
       ...(config.env ?? {})
     };
 
-    const child = spawn(config.command, [], {
+    const child = spawn(resolvedCommand, [], {
       cwd: config.cwd,
       env: mergedEnv,
       shell: true,
@@ -618,6 +659,7 @@ export class ProcessManager {
     this.attachStream(svc, child.stderr, 'stderr');
 
     child.on('error', (err) => {
+      if (svc.child !== child) return;
       this.appendSystemLine(
         svc,
         `[multi-service-console] Spawn error: ${err.message}`,
@@ -633,27 +675,8 @@ export class ProcessManager {
     });
 
     child.on('close', (code, signal) => {
-      if (svc.killTimer) {
-        clearTimeout(svc.killTimer);
-        svc.killTimer = null;
-      }
-      const wasStoppedByUser = svc.stopRequested;
-      svc.child = null;
-      svc.runtime.pid = null;
-      svc.runtime.childPids = [];
-      svc.runtime.detectedPorts = [];
-      svc.runtime.stoppedAt = Date.now();
-      svc.runtime.exitCode = code ?? (wasStoppedByUser ? 0 : -1);
-      svc.runtime.status =
-        wasStoppedByUser || code === 0 ? 'stopped' : 'crashed';
-
-      this.appendSystemLine(
-        svc,
-        `[multi-service-console] Process exited (code=${code ?? 'null'}${signal ? `, signal=${signal}` : ''})`,
-        svc.runtime.status === 'crashed'
-      );
-      this.flushBatch(svc);
-      this.broadcastRuntime(svc.runtime);
+      if (svc.child !== child) return;
+      this.finalizeChildExit(svc, code, signal);
     });
 
     // Trigger an early PID/port probe 1.2s after launch
@@ -664,81 +687,258 @@ export class ProcessManager {
     return { ...svc.runtime };
   }
 
+  private finalizeChildExit(
+    svc: ManagedService,
+    code: number | null,
+    signal: NodeJS.Signals | null
+  ): void {
+    if (svc.killTimer) {
+      clearTimeout(svc.killTimer);
+      svc.killTimer = null;
+    }
+    const wasStoppedByUser = svc.stopRequested;
+    svc.child = null;
+    svc.runtime.pid = null;
+    svc.runtime.childPids = [];
+    svc.runtime.detectedPorts = [];
+    svc.runtime.stoppedAt = Date.now();
+    svc.runtime.exitCode = code ?? (wasStoppedByUser ? 0 : -1);
+    svc.runtime.status =
+      wasStoppedByUser || code === 0 ? 'stopped' : 'crashed';
+
+    this.appendSystemLine(
+      svc,
+      `[multi-service-console] Process exited (code=${code ?? 'null'}${signal ? `, signal=${signal}` : ''})`,
+      svc.runtime.status === 'crashed'
+    );
+    this.flushBatch(svc);
+    this.broadcastRuntime(svc.runtime);
+  }
+
   public async stopService(serviceId: string, force = false): Promise<void> {
     const svc = this.services.get(serviceId);
-    if (!svc || !svc.child) return;
+    if (!svc) return;
 
-    const pid = svc.child.pid;
+    const childRef = svc.child;
+    const rootPid = childRef?.pid ?? svc.runtime.pid;
+    if (!childRef && !rootPid && svc.runtime.childPids.length === 0) {
+      if (svc.runtime.status !== 'stopped') {
+        svc.runtime.status = 'stopped';
+        this.broadcastRuntime(svc.runtime);
+      }
+      return;
+    }
+
     svc.stopRequested = true;
     svc.runtime.status = 'stopping';
     this.appendSystemLine(
       svc,
-      `[multi-service-console] Stopping process${pid ? ` (PID ${pid})` : ''}${force ? ' [force]' : ''}...`
+      `[multi-service-console] Stopping process${rootPid ? ` (PID ${rootPid})` : ''}${force ? ' [force]' : ''}...`
     );
     this.broadcastRuntime(svc.runtime);
 
-    if (!pid) {
-      svc.child.kill('SIGKILL');
+    if (process.platform === 'win32') {
+      const pidsToKill = new Set<number>();
+      for (const p of svc.runtime.childPids) {
+        if (p > 0) pidsToKill.add(p);
+      }
+      if (rootPid && rootPid > 0) {
+        pidsToKill.add(rootPid);
+      }
+
+      // Immediately terminate known PIDs and simultaneously discover any new descendants / listening PIDs
+      const immediateKills = Array.from(pidsToKill)
+        .reverse()
+        .map((targetPid) =>
+          execCommand('taskkill', ['/PID', String(targetPid), '/T', '/F'], 2000)
+        );
+
+      const [liveDescendants, portPids] = await Promise.all([
+        rootPid && rootPid > 0
+          ? this.findDescendantPids(rootPid)
+          : Promise.resolve([]),
+        svc.runtime.detectedPorts.length > 0
+          ? this.findListeningPidsForPorts(svc.runtime.detectedPorts)
+          : Promise.resolve([]),
+        ...immediateKills
+      ]);
+
+      const extraPids = new Set<number>();
+      for (const p of liveDescendants) {
+        if (p > 0 && !pidsToKill.has(p)) extraPids.add(p);
+      }
+      for (const p of portPids) {
+        if (p > 0 && !pidsToKill.has(p)) extraPids.add(p);
+      }
+
+      if (extraPids.size > 0) {
+        await Promise.all(
+          Array.from(extraPids)
+            .reverse()
+            .map((targetPid) =>
+              execCommand(
+                'taskkill',
+                ['/PID', String(targetPid), '/T', '/F'],
+                2000
+              )
+            )
+        );
+      }
+
+      // Direct Win32 TerminateProcess guarantee for any PID still alive
+      for (const p of [...extraPids, ...pidsToKill]) {
+        try {
+          process.kill(p, 0);
+          process.kill(p, 'SIGKILL');
+        } catch {
+          // Already exited
+        }
+      }
+
+      // Give Node a short moment to emit 'close'; if inherited stdio pipes stay open, destroy them
+      if (childRef) {
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+          };
+          childRef.once('close', finish);
+
+          setTimeout(() => {
+            try {
+              childRef.stdout?.destroy();
+              childRef.stderr?.destroy();
+              childRef.stdin?.destroy();
+            } catch {
+              // Ignore stream destroy errors
+            }
+          }, 300);
+
+          setTimeout(() => {
+            if (svc.child === childRef) {
+              this.finalizeChildExit(svc, 0, null);
+            }
+            finish();
+          }, 900);
+        });
+      } else {
+        svc.runtime.pid = null;
+        svc.runtime.childPids = [];
+        svc.runtime.detectedPorts = [];
+        svc.runtime.stoppedAt = Date.now();
+        svc.runtime.status = 'stopped';
+        this.broadcastRuntime(svc.runtime);
+      }
+      return;
+    }
+
+    // POSIX fallback
+    if (!childRef) {
+      svc.runtime.status = 'stopped';
+      this.broadcastRuntime(svc.runtime);
       return;
     }
 
     await new Promise<void>((resolve) => {
-      const childRef = svc.child;
-      if (!childRef) {
-        resolve();
-        return;
-      }
-
       let settled = false;
       const done = () => {
         if (settled) return;
         settled = true;
         resolve();
       };
-
       childRef.once('close', done);
-
-      if (process.platform === 'win32') {
-        const args = force
-          ? ['/PID', String(pid), '/T', '/F']
-          : ['/PID', String(pid), '/T'];
-        execFile('taskkill', args, { windowsHide: true }, () => {
-          // If graceful taskkill didn't close it within 2.5s, force kill the tree
-          if (!force && svc.child === childRef) {
-            svc.killTimer = setTimeout(() => {
-              execFile(
-                'taskkill',
-                ['/PID', String(pid), '/T', '/F'],
-                { windowsHide: true },
-                () => done()
-              );
-            }, 2500);
+      try {
+        childRef.kill(force ? 'SIGKILL' : 'SIGTERM');
+      } catch {
+        // Ignore
+      }
+      svc.killTimer = setTimeout(() => {
+        if (svc.child === childRef) {
+          try {
+            childRef.kill('SIGKILL');
+          } catch {
+            // Ignore
           }
-        });
-        setTimeout(done, force ? 2000 : 4000);
-      } else {
-        try {
-          childRef.kill(force ? 'SIGKILL' : 'SIGTERM');
-        } catch {
-          // Ignore
         }
         setTimeout(() => {
           if (svc.child === childRef) {
-            try {
-              childRef.kill('SIGKILL');
-            } catch {
-              // Ignore
-            }
+            this.finalizeChildExit(svc, 0, 'SIGKILL');
           }
           done();
-        }, 2500);
-      }
+        }, 400);
+      }, 2000);
     });
   }
 
   public async restartService(serviceId: string): Promise<void> {
-    await this.stopService(serviceId, false);
+    await this.stopService(serviceId, true);
+    await new Promise((r) => setTimeout(r, 150));
     this.startService(serviceId);
+  }
+
+  private async findDescendantPids(rootPid: number): Promise<number[]> {
+    if (process.platform !== 'win32') return [];
+    const procRaw = await execCommand('powershell', [
+      '-NoProfile',
+      '-Command',
+      'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId | ConvertTo-Json -Compress'
+    ]);
+    if (!procRaw.trim()) return [];
+
+    const childrenByParent = new Map<number, number[]>();
+    try {
+      const parsed = JSON.parse(procRaw) as
+        | Array<{ ProcessId: number; ParentProcessId: number }>
+        | { ProcessId: number; ParentProcessId: number };
+      const list = Array.isArray(parsed) ? parsed : [parsed];
+      for (const item of list) {
+        if (!item) continue;
+        const arr = childrenByParent.get(item.ParentProcessId) ?? [];
+        arr.push(item.ProcessId);
+        childrenByParent.set(item.ParentProcessId, arr);
+      }
+    } catch {
+      return [];
+    }
+
+    const descendants: number[] = [];
+    const queue = [rootPid];
+    const visited = new Set<number>([rootPid]);
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      for (const kid of childrenByParent.get(current) ?? []) {
+        if (!visited.has(kid)) {
+          visited.add(kid);
+          descendants.push(kid);
+          queue.push(kid);
+        }
+      }
+    }
+    return descendants;
+  }
+
+  private async findListeningPidsForPorts(ports: number[]): Promise<number[]> {
+    if (process.platform !== 'win32' || ports.length === 0) return [];
+    const portSet = new Set(ports);
+    const netstatOut = await execCommand('netstat', ['-ano', '-p', 'TCP']);
+    const pids = new Set<number>();
+    for (const line of netstatOut.split(/\r?\n/)) {
+      if (!line.includes('LISTENING')) continue;
+      const parts = line.trim().split(/\s+/);
+      if (parts.length < 5) continue;
+      const localAddr = parts[1];
+      const pid = Number.parseInt(parts[4], 10);
+      if (!Number.isFinite(pid) || pid <= 0) continue;
+      const colonIdx = localAddr.lastIndexOf(':');
+      if (colonIdx === -1) continue;
+      const addrPort = Number.parseInt(localAddr.slice(colonIdx + 1), 10);
+      if (portSet.has(addrPort)) {
+        pids.add(pid);
+      }
+    }
+    return Array.from(pids);
   }
 
   public async startGroup(groupName: string): Promise<void> {
@@ -996,6 +1196,7 @@ export class ProcessManager {
       }
 
       for (const svc of activeServices) {
+        if (svc.stopRequested || !svc.child) continue;
         const rootPid = svc.runtime.pid;
         if (!rootPid) continue;
 
@@ -1061,12 +1262,48 @@ export class ProcessManager {
   }
 }
 
-function execCommand(cmd: string, args: string[]): Promise<string> {
+export function normalizeShellCommand(command: string): string {
+  const lines = command
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+
+  if (lines.length <= 1) {
+    return lines[0] ?? command.trim();
+  }
+
+  let combined = '';
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (i === 0) {
+      combined = line;
+      continue;
+    }
+
+    if (combined.endsWith('^')) {
+      combined = `${combined.slice(0, -1).trimEnd()} ${line}`;
+    } else if (
+      /(?:&&|\|\||[&;])$/.test(combined) ||
+      /^(?:&&|\|\|)/.test(line)
+    ) {
+      combined = `${combined} ${line}`;
+    } else {
+      combined = `${combined} && ${line}`;
+    }
+  }
+  return combined;
+}
+
+function execCommand(
+  cmd: string,
+  args: string[],
+  timeoutMs = 2500
+): Promise<string> {
   return new Promise((resolve) => {
     execFile(
       cmd,
       args,
-      { windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+      { windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 },
       (_err, stdout) => {
         resolve(stdout || '');
       }

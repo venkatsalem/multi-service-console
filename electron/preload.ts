@@ -27,6 +27,11 @@ export interface MultiServiceConsoleApi {
     }
   ) => Promise<ServiceSnapshot>;
   deleteService: (serviceId: string) => Promise<void>;
+  reorderService: (
+    draggedId: string,
+    targetId: string,
+    position: 'before' | 'after'
+  ) => Promise<ServiceSnapshot[]>;
   startService: (serviceId: string) => Promise<ServiceRuntimeState | null>;
   stopService: (serviceId: string, force?: boolean) => Promise<void>;
   restartService: (serviceId: string) => Promise<void>;
@@ -37,6 +42,12 @@ export interface MultiServiceConsoleApi {
   stopAll: (force?: boolean) => Promise<void>;
   killPort: (port: number) => Promise<{ killedPids: number[] }>;
   openPopout: (serviceId: string, serviceName?: string) => Promise<void>;
+  showInExplorer: (
+    folderPath: string
+  ) => Promise<{ ok: boolean; error?: string }>;
+  openTerminal: (
+    folderPath: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   pickFolder: () => Promise<string | null>;
   scanFolder: (folderPath: string) => Promise<DiscoveredServiceCandidate[]>;
   importMany: (
@@ -70,6 +81,8 @@ const api: MultiServiceConsoleApi = {
   getLogs: (serviceId) => ipcRenderer.invoke('process:getLogs', serviceId),
   upsertService: (input) => ipcRenderer.invoke('process:upsert', input),
   deleteService: (serviceId) => ipcRenderer.invoke('process:delete', serviceId),
+  reorderService: (draggedId, targetId, position) =>
+    ipcRenderer.invoke('process:reorder', draggedId, targetId, position),
   startService: (serviceId) => ipcRenderer.invoke('process:start', serviceId),
   stopService: (serviceId, force) =>
     ipcRenderer.invoke('process:stop', serviceId, force),
@@ -84,6 +97,10 @@ const api: MultiServiceConsoleApi = {
   killPort: (port) => ipcRenderer.invoke('process:killPort', port),
   openPopout: (serviceId, serviceName) =>
     ipcRenderer.invoke('window:openPopout', serviceId, serviceName),
+  showInExplorer: (folderPath) =>
+    ipcRenderer.invoke('shell:showInExplorer', folderPath),
+  openTerminal: (folderPath) =>
+    ipcRenderer.invoke('shell:openTerminal', folderPath),
   pickFolder: () => ipcRenderer.invoke('dialog:pickFolder'),
   scanFolder: (folderPath) =>
     ipcRenderer.invoke('workspace:scanFolder', folderPath),

@@ -5,8 +5,10 @@ import {
   dialog,
   ipcMain,
   nativeTheme,
-  screen
+  screen,
+  shell
 } from 'electron';
+import { spawn } from 'child_process';
 import fs from 'fs';
 import net from 'net';
 import path from 'path';
@@ -133,8 +135,17 @@ async function loadRenderer(
   });
 }
 
+function getAppIconPath(): string | undefined {
+  const file =
+    process.platform === 'win32'
+      ? path.join(__dirname, '../../assets/icon.ico')
+      : path.join(__dirname, '../../assets/icon.png');
+  return fs.existsSync(file) ? file : undefined;
+}
+
 function createMainWindow(): BrowserWindow {
   const saved = loadWindowState();
+  const icon = getAppIconPath();
   const win = new BrowserWindow({
     width: saved.width,
     height: saved.height,
@@ -143,6 +154,7 @@ function createMainWindow(): BrowserWindow {
       : {}),
     minWidth: 960,
     minHeight: 600,
+    icon,
     title: 'Multi-Service Console',
     backgroundColor: nativeTheme.shouldUseDarkColors ? '#18191c' : '#ffffff',
     autoHideMenuBar: true,
@@ -168,6 +180,10 @@ function createMainWindow(): BrowserWindow {
   win.on('unmaximize', scheduleSave);
 
   win.on('close', (e) => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
     saveWindowState(win);
     if (isQuitting) return;
 
@@ -192,7 +208,7 @@ function createMainWindow(): BrowserWindow {
             for (const popWin of popoutWindows.values()) {
               if (!popWin.isDestroyed()) popWin.destroy();
             }
-            win.destroy();
+            if (!win.isDestroyed()) win.destroy();
             app.quit();
           }
         });
@@ -204,6 +220,10 @@ function createMainWindow(): BrowserWindow {
   });
 
   win.on('closed', () => {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+    }
     if (mainWindow === win) mainWindow = null;
   });
 
@@ -225,6 +245,7 @@ function openPopoutWindow(serviceId: string, serviceName?: string): void {
     height: 840,
     minWidth: 760,
     minHeight: 500,
+    icon: getAppIconPath(),
     title: serviceName
       ? `${serviceName} — Console`
       : 'Service Console — Popout',
@@ -237,12 +258,13 @@ function openPopoutWindow(serviceId: string, serviceName?: string): void {
     }
   });
 
-  windowPopoutServiceMap.set(win.webContents.id, serviceId);
+  const webContentsId = win.webContents.id;
+  windowPopoutServiceMap.set(webContentsId, serviceId);
   popoutWindows.set(serviceId, win);
 
   win.on('closed', () => {
     popoutWindows.delete(serviceId);
-    windowPopoutServiceMap.delete(win.webContents.id);
+    windowPopoutServiceMap.delete(webContentsId);
   });
 
   void loadRenderer(win, serviceId);
@@ -320,6 +342,16 @@ function registerIpcHandlers(): void {
     processManager.deleteService(serviceId)
   );
 
+  ipcMain.handle(
+    'process:reorder',
+    (
+      _e,
+      draggedId: string,
+      targetId: string,
+      position: 'before' | 'after'
+    ) => processManager.reorderService(draggedId, targetId, position)
+  );
+
   ipcMain.handle('process:start', (_e, serviceId: string) =>
     processManager.startService(serviceId)
   );
@@ -358,6 +390,77 @@ function registerIpcHandlers(): void {
     'window:openPopout',
     (_e, serviceId: string, serviceName?: string) => {
       openPopoutWindow(serviceId, serviceName);
+    }
+  );
+
+  ipcMain.handle(
+    'shell:showInExplorer',
+    async (_e, folderPath: string): Promise<{ ok: boolean; error?: string }> => {
+      if (!folderPath || !fs.existsSync(folderPath)) {
+        return {
+          ok: false,
+          error: `Working directory does not exist: ${folderPath}`
+        };
+      }
+      const err = await shell.openPath(folderPath);
+      return err ? { ok: false, error: err } : { ok: true };
+    }
+  );
+
+  ipcMain.handle(
+    'shell:openTerminal',
+    async (_e, folderPath: string): Promise<{ ok: boolean; error?: string }> => {
+      if (!folderPath || !fs.existsSync(folderPath)) {
+        return {
+          ok: false,
+          error: `Working directory does not exist: ${folderPath}`
+        };
+      }
+
+      if (process.platform === 'win32') {
+        return new Promise((resolve) => {
+          const wt = spawn('wt.exe', ['-d', folderPath], {
+            cwd: folderPath,
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: false
+          });
+
+          let settled = false;
+          wt.once('spawn', () => {
+            if (settled) return;
+            settled = true;
+            wt.unref();
+            resolve({ ok: true });
+          });
+
+          wt.once('error', () => {
+            if (settled) return;
+            settled = true;
+            try {
+              const fallback = spawn(
+                'cmd.exe',
+                ['/c', 'start', '""', 'cmd.exe'],
+                {
+                  cwd: folderPath,
+                  detached: true,
+                  stdio: 'ignore',
+                  windowsHide: false
+                }
+              );
+              fallback.unref();
+              resolve({ ok: true });
+            } catch (err) {
+              resolve({
+                ok: false,
+                error: err instanceof Error ? err.message : String(err)
+              });
+            }
+          });
+        });
+      }
+
+      return { ok: false, error: 'Unsupported platform for terminal launch' };
     }
   );
 

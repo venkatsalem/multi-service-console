@@ -1,16 +1,18 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
   ChevronDown,
   ChevronRight,
   Copy,
   Edit3,
+  ExternalLink,
   FolderOpen,
+  GripVertical,
   Play,
   RotateCw,
   Search,
   Square,
-  Trash2,
+  Terminal,
   X
 } from 'lucide-react';
 import { ServiceConfig, ServiceSnapshot } from '../../shared/types';
@@ -20,16 +22,29 @@ interface ProcessSidebarProps {
   selectedServiceId: string | null;
   onSelectService: (id: string) => void;
   onStartService: (id: string) => void;
-  onStopService: (id: string) => void;
+  onStopService: (id: string, force?: boolean) => void;
   onRestartService: (id: string) => void;
   onEditService: (config: ServiceConfig) => void;
-  onDeleteService: (id: string) => void;
+  onPopoutService: (id: string, name: string) => void;
+  onShowInExplorer: (cwd: string) => void;
+  onOpenTerminal: (cwd: string) => void;
+  onReorderService: (
+    draggedId: string,
+    targetId: string,
+    position: 'before' | 'after'
+  ) => void;
   onStartGroup: (group: string) => void;
   onStopGroup: (group: string) => void;
   onCopyText: (text: string, label: string) => void;
 }
 
 type SidebarFilter = 'all' | 'running' | 'errors';
+
+interface ContextMenuState {
+  x: number;
+  y: number;
+  snapshot: ServiceSnapshot;
+}
 
 export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
   services,
@@ -39,7 +54,10 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
   onStopService,
   onRestartService,
   onEditService,
-  onDeleteService,
+  onPopoutService,
+  onShowInExplorer,
+  onOpenTerminal,
+  onReorderService,
   onStartGroup,
   onStopGroup,
   onCopyText
@@ -49,6 +67,36 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(
     new Set()
   );
+
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+  const [dropTarget, setDropTarget] = useState<{
+    id: string;
+    position: 'before' | 'after';
+  } | null>(null);
+
+  const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const onPointerDown = (e: MouseEvent) => {
+      if (
+        contextMenuRef.current &&
+        !contextMenuRef.current.contains(e.target as Node)
+      ) {
+        setContextMenu(null);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setContextMenu(null);
+    };
+    window.addEventListener('mousedown', onPointerDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onPointerDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [contextMenu]);
 
   const grouped = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -96,6 +144,53 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
       else next.add(group);
       return next;
     });
+  };
+
+  const openContextMenu = (e: React.MouseEvent, snap: ServiceSnapshot) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const menuWidth = 210;
+    const menuHeight = 260;
+    const x = Math.min(e.clientX, window.innerWidth - menuWidth - 8);
+    const y = Math.min(e.clientY, window.innerHeight - menuHeight - 8);
+    setContextMenu({ x, y, snapshot: snap });
+  };
+
+  const handleDragStart = (e: React.DragEvent, id: string) => {
+    setDraggedId(id);
+    setContextMenu(null);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', id);
+  };
+
+  const handleDragOver = (e: React.DragEvent, targetId: string) => {
+    if (!draggedId || draggedId === targetId) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const position: 'before' | 'after' =
+      e.clientY - rect.top < rect.height / 2 ? 'before' : 'after';
+    setDropTarget((prev) =>
+      prev && prev.id === targetId && prev.position === position
+        ? prev
+        : { id: targetId, position }
+    );
+  };
+
+  const handleDrop = (e: React.DragEvent, targetId: string) => {
+    e.preventDefault();
+    const sourceId = draggedId || e.dataTransfer.getData('text/plain');
+    const pos = dropTarget?.id === targetId ? dropTarget.position : 'before';
+    setDraggedId(null);
+    setDropTarget(null);
+    if (sourceId && sourceId !== targetId) {
+      onReorderService(sourceId, targetId, pos);
+    }
+  };
+
+  const handleDragEnd = () => {
+    setDraggedId(null);
+    setDropTarget(null);
   };
 
   return (
@@ -225,7 +320,8 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
                 </div>
 
                 {!isCollapsed &&
-                  items.map(({ config, runtime }) => {
+                  items.map((snap) => {
+                    const { config, runtime } = snap;
                     const isSelected = config.id === selectedServiceId;
                     const isRunning =
                       runtime.status === 'running' ||
@@ -240,14 +336,35 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
                         ? runtime.childPids[runtime.childPids.length - 1]
                         : runtime.pid;
 
+                    const isDragging = draggedId === config.id;
+                    const dropClass =
+                      dropTarget?.id === config.id
+                        ? dropTarget.position === 'before'
+                          ? 'drop-before'
+                          : 'drop-after'
+                        : '';
+
                     return (
                       <div
                         key={config.id}
-                        className={`service-card ${isSelected ? 'selected' : ''} status-${runtime.status}`}
+                        draggable
+                        onDragStart={(e) => handleDragStart(e, config.id)}
+                        onDragOver={(e) => handleDragOver(e, config.id)}
+                        onDrop={(e) => handleDrop(e, config.id)}
+                        onDragEnd={handleDragEnd}
+                        onContextMenu={(e) => openContextMenu(e, snap)}
+                        className={`service-card ${isSelected ? 'selected' : ''} status-${runtime.status} ${isDragging ? 'dragging' : ''} ${dropClass}`}
                         onClick={() => onSelectService(config.id)}
+                        title="Drag to reorder · Right-click to edit"
                       >
                         <div className="service-card-top">
                           <div className="service-title-wrap">
+                            <span
+                              className="drag-handle"
+                              title="Drag to reorder"
+                            >
+                              <GripVertical size={13} />
+                            </span>
                             <span
                               className={`status-dot dot-${runtime.status}`}
                               title={runtime.status}
@@ -318,48 +435,38 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
                             {!isRunning && !isStopping ? (
                               <button
                                 type="button"
-                                className="icon-btn-xs action-start"
+                                className="row-run-btn is-start"
                                 title="Start process"
                                 onClick={() => onStartService(config.id)}
                               >
-                                <Play size={13} />
+                                <Play size={15} fill="currentColor" />
                               </button>
                             ) : (
                               <>
                                 <button
                                   type="button"
-                                  className="icon-btn-xs action-stop"
-                                  title="Stop process"
-                                  onClick={() => onStopService(config.id)}
-                                >
-                                  <Square size={12} />
-                                </button>
-                                <button
-                                  type="button"
-                                  className="icon-btn-xs"
+                                  className="row-restart-btn"
                                   title="Restart process"
                                   onClick={() => onRestartService(config.id)}
                                 >
-                                  <RotateCw size={12} />
+                                  <RotateCw size={14} />
+                                </button>
+                                <button
+                                  type="button"
+                                  className="row-run-btn is-stop"
+                                  title={
+                                    isStopping
+                                      ? 'Force stop process tree'
+                                      : 'Stop process'
+                                  }
+                                  onClick={() =>
+                                    onStopService(config.id, isStopping)
+                                  }
+                                >
+                                  <Square size={13} fill="currentColor" />
                                 </button>
                               </>
                             )}
-                            <button
-                              type="button"
-                              className="icon-btn-xs"
-                              title="Edit process"
-                              onClick={() => onEditService(config)}
-                            >
-                              <Edit3 size={12} />
-                            </button>
-                            <button
-                              type="button"
-                              className="icon-btn-xs action-delete"
-                              title="Delete process"
-                              onClick={() => onDeleteService(config.id)}
-                            >
-                              <Trash2 size={12} />
-                            </button>
                           </div>
                         </div>
                       </div>
@@ -370,6 +477,114 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
           })
         )}
       </div>
+
+      {contextMenu && (
+        <div
+          ref={contextMenuRef}
+          className="context-menu"
+          style={{ left: `${contextMenu.x}px`, top: `${contextMenu.y}px` }}
+        >
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              const cfg = contextMenu.snapshot.config;
+              setContextMenu(null);
+              onEditService(cfg);
+            }}
+          >
+            <Edit3 size={14} />
+            <span>Edit Process...</span>
+          </button>
+
+          <div className="context-menu-divider" />
+
+          {contextMenu.snapshot.runtime.status !== 'running' &&
+          contextMenu.snapshot.runtime.status !== 'starting' &&
+          contextMenu.snapshot.runtime.status !== 'stopping' ? (
+            <button
+              type="button"
+              className="context-menu-item"
+              onClick={() => {
+                const id = contextMenu.snapshot.config.id;
+                setContextMenu(null);
+                onStartService(id);
+              }}
+            >
+              <Play size={14} />
+              <span>Start Process</span>
+            </button>
+          ) : (
+            <>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  const id = contextMenu.snapshot.config.id;
+                  setContextMenu(null);
+                  onStopService(id);
+                }}
+              >
+                <Square size={14} />
+                <span>Stop Process</span>
+              </button>
+              <button
+                type="button"
+                className="context-menu-item"
+                onClick={() => {
+                  const id = contextMenu.snapshot.config.id;
+                  setContextMenu(null);
+                  onRestartService(id);
+                }}
+              >
+                <RotateCw size={14} />
+                <span>Restart Process</span>
+              </button>
+            </>
+          )}
+
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              const { id, name } = contextMenu.snapshot.config;
+              setContextMenu(null);
+              onPopoutService(id, name);
+            }}
+          >
+            <ExternalLink size={14} />
+            <span>Pop Out Console</span>
+          </button>
+
+          <div className="context-menu-divider" />
+
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              const cwd = contextMenu.snapshot.config.cwd;
+              setContextMenu(null);
+              onShowInExplorer(cwd);
+            }}
+          >
+            <FolderOpen size={14} />
+            <span>Show in Explorer</span>
+          </button>
+
+          <button
+            type="button"
+            className="context-menu-item"
+            onClick={() => {
+              const cwd = contextMenu.snapshot.config.cwd;
+              setContextMenu(null);
+              onOpenTerminal(cwd);
+            }}
+          >
+            <Terminal size={14} />
+            <span>Open Terminal</span>
+          </button>
+        </div>
+      )}
     </aside>
   );
 };
