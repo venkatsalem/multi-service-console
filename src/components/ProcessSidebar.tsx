@@ -7,10 +7,13 @@ import {
   Edit3,
   ExternalLink,
   FolderOpen,
+  FolderSearch,
   GripVertical,
   Play,
+  Plus,
   RotateCw,
   Search,
+  Settings,
   Square,
   Terminal,
   X
@@ -20,6 +23,9 @@ import { ServiceConfig, ServiceSnapshot } from '../../shared/types';
 interface ProcessSidebarProps {
   services: ServiceSnapshot[];
   selectedServiceId: string | null;
+  onOpenSettings: () => void;
+  onAddService: () => void;
+  onScanWorkspace: () => void;
   onSelectService: (id: string) => void;
   onStartService: (id: string) => void;
   onStopService: (id: string, force?: boolean) => void;
@@ -49,6 +55,9 @@ interface ContextMenuState {
 export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
   services,
   selectedServiceId,
+  onOpenSettings,
+  onAddService,
+  onScanWorkspace,
   onSelectService,
   onStartService,
   onStopService,
@@ -196,6 +205,26 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
   return (
     <aside className="sidebar">
       <div className="sidebar-controls">
+        <div className="sidebar-top-actions">
+          <button
+            type="button"
+            className="btn btn-primary sidebar-action-btn"
+            onClick={onAddService}
+          >
+            <Plus size={14} />
+            Add Process
+          </button>
+          <button
+            type="button"
+            className="btn btn-secondary sidebar-action-btn"
+            onClick={onScanWorkspace}
+            title="Scan a folder for Maven, Gradle, Node.js, or Docker Compose services"
+          >
+            <FolderSearch size={14} />
+            Scan Folder
+          </button>
+        </div>
+
         <div className="sidebar-search-box">
           <Search size={13} className="search-icon" />
           <input
@@ -585,6 +614,18 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
           </button>
         </div>
       )}
+
+      <div className="sidebar-footer">
+        <button
+          type="button"
+          className="btn btn-secondary sidebar-settings-btn"
+          onClick={onOpenSettings}
+          title="Open Settings"
+        >
+          <Settings size={14} />
+          <span>Settings</span>
+        </button>
+      </div>
     </aside>
   );
 };

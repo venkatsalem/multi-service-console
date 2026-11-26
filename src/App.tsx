@@ -1,18 +1,24 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react';
 import {
   Check,
   ChevronDown,
   Download,
   FolderOpen,
-  FolderSearch,
   Globe,
   Monitor,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
-  Plus,
   Save,
+  Settings,
   Square,
   Sun,
   Terminal,
@@ -30,8 +36,12 @@ import { ConsolePane } from './components/ConsolePane';
 import { ProcessSidebar } from './components/ProcessSidebar';
 import { ScanWorkspaceModal } from './components/ScanWorkspaceModal';
 import { ServiceFormModal } from './components/ServiceFormModal';
-
-type ThemePreference = 'system' | 'light' | 'dark';
+import { SettingsModal, ThemePreference } from './components/SettingsModal';
+import {
+  FontPreferences,
+  loadFontPreferences,
+  saveAndApplyFontPreferences
+} from './utils/fontPreferences';
 
 const MAX_RENDERER_LINES = 25_000;
 
@@ -72,6 +82,10 @@ export const App: React.FC = () => {
     editing: ServiceConfig | null;
   }>({ open: false, editing: null });
   const [scanModalOpen, setScanModalOpen] = useState(false);
+  const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [fontPreferences, setFontPreferences] = useState<FontPreferences>(() =>
+    loadFontPreferences()
+  );
   const [toast, setToast] = useState<ToastState | null>(null);
 
   const toastTimerRef = useRef<number | null>(null);
@@ -111,6 +125,34 @@ export const App: React.FC = () => {
     localStorage.setItem('msc.themePreference', themePreference);
     void window.serviceConsole.setThemeSource(themePreference);
   }, [effectiveDark, themePreference]);
+
+  useLayoutEffect(() => {
+    saveAndApplyFontPreferences(fontPreferences);
+  }, [fontPreferences]);
+
+  const handleChangeFonts = useCallback((next: FontPreferences) => {
+    saveAndApplyFontPreferences(next);
+    setFontPreferences(next);
+  }, []);
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'msc.fontPreferences') {
+        const next = loadFontPreferences();
+        setFontPreferences(next);
+        saveAndApplyFontPreferences(next);
+      } else if (
+        e.key === 'msc.themePreference' &&
+        (e.newValue === 'system' ||
+          e.newValue === 'light' ||
+          e.newValue === 'dark')
+      ) {
+        setThemePreference(e.newValue);
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   const cycleTheme = () => {
     setThemePreference((prev) =>
@@ -415,6 +457,8 @@ export const App: React.FC = () => {
             snapshot={activeSnapshot}
             logs={activeLogs}
             isPopout
+            consoleFont={fontPreferences.consoleFont}
+            consoleFontSize={fontPreferences.consoleFontSize}
             onStart={(id) => void window.serviceConsole.startService(id)}
             onStop={(id, force) =>
               void window.serviceConsole.stopService(id, force)
@@ -530,6 +574,66 @@ export const App: React.FC = () => {
                   </div>
                 </button>
 
+                <div className="storage-menu-divider" />
+
+                <button
+                  type="button"
+                  className="storage-menu-item"
+                  onClick={async () => {
+                    setStorageMenuOpen(false);
+                    try {
+                      const imported =
+                        await window.serviceConsole.importConfigs();
+                      if (imported) {
+                        showToast('Imported service configurations');
+                      }
+                    } catch (err) {
+                      showToast(
+                        err instanceof Error ? err.message : 'Import failed',
+                        'error'
+                      );
+                    }
+                  }}
+                >
+                  <Upload size={14} />
+                  <div className="storage-menu-item-text">
+                    <span>Import JSON...</span>
+                    <small>Add services from a JSON file</small>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className="storage-menu-item"
+                  disabled={services.length === 0}
+                  onClick={async () => {
+                    setStorageMenuOpen(false);
+                    const ok = await window.serviceConsole.exportConfigs();
+                    if (ok) showToast('Exported service configurations');
+                  }}
+                >
+                  <Download size={14} />
+                  <div className="storage-menu-item-text">
+                    <span>Export JSON...</span>
+                    <small>Save current service list to JSON</small>
+                  </div>
+                </button>
+
+                <button
+                  type="button"
+                  className="storage-menu-item"
+                  onClick={() => {
+                    setStorageMenuOpen(false);
+                    setSettingsModalOpen(true);
+                  }}
+                >
+                  <Settings size={14} />
+                  <div className="storage-menu-item-text">
+                    <span>Settings...</span>
+                    <small>Theme, UI &amp; console fonts</small>
+                  </div>
+                </button>
+
                 {storage && storage.recentWorkspaces.length > 0 && (
                   <>
                     <div className="storage-menu-divider" />
@@ -599,27 +703,6 @@ export const App: React.FC = () => {
         <div className="top-bar-right">
           <button
             type="button"
-            className="btn btn-primary"
-            onClick={() => setFormModalState({ open: true, editing: null })}
-          >
-            <Plus size={14} />
-            Add Process
-          </button>
-
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => setScanModalOpen(true)}
-            title="Scan a folder for Maven, Gradle, Node.js, or Docker Compose services"
-          >
-            <FolderSearch size={14} />
-            Scan Folder
-          </button>
-
-          <div className="toolbar-divider" />
-
-          <button
-            type="button"
             className="btn btn-start-subtle"
             disabled={services.length === 0}
             onClick={() => void window.serviceConsole.startAll()}
@@ -639,54 +722,6 @@ export const App: React.FC = () => {
             <Square size={12} />
             Stop All
           </button>
-
-          <div className="toolbar-divider" />
-
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={async () => {
-              try {
-                const imported = await window.serviceConsole.importConfigs();
-                if (imported) {
-                  showToast('Imported service configurations');
-                }
-              } catch (err) {
-                showToast(
-                  err instanceof Error ? err.message : 'Import failed',
-                  'error'
-                );
-              }
-            }}
-            title="Import services from JSON"
-          >
-            <Upload size={14} />
-            Import
-          </button>
-
-          <button
-            type="button"
-            className="btn btn-secondary"
-            disabled={services.length === 0}
-            onClick={async () => {
-              const ok = await window.serviceConsole.exportConfigs();
-              if (ok) showToast('Exported service configurations');
-            }}
-            title="Export services to JSON"
-          >
-            <Download size={14} />
-            Export
-          </button>
-
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={cycleTheme}
-            title={`Theme: ${themePreference} (click to switch)`}
-          >
-            <ThemeIcon size={14} />
-            {themePreference}
-          </button>
         </div>
       </header>
 
@@ -700,6 +735,11 @@ export const App: React.FC = () => {
               <ProcessSidebar
                 services={services}
                 selectedServiceId={selectedServiceId}
+                onOpenSettings={() => setSettingsModalOpen(true)}
+                onAddService={() =>
+                  setFormModalState({ open: true, editing: null })
+                }
+                onScanWorkspace={() => setScanModalOpen(true)}
                 onSelectService={(id) => void handleSelectService(id)}
                 onStartService={(id) =>
                   void window.serviceConsole.startService(id)
@@ -755,6 +795,8 @@ export const App: React.FC = () => {
         <ConsolePane
           snapshot={activeSnapshot}
           logs={activeLogs}
+          consoleFont={fontPreferences.consoleFont}
+          consoleFontSize={fontPreferences.consoleFontSize}
           onStart={(id) => void window.serviceConsole.startService(id)}
           onStop={(id, force) =>
             void window.serviceConsole.stopService(id, force)
@@ -806,6 +848,19 @@ export const App: React.FC = () => {
               setSelectedServiceId(updated[0].config.id);
             }
             showToast(`Imported ${configs.length} service(s)`);
+          }}
+        />
+      )}
+
+      {settingsModalOpen && (
+        <SettingsModal
+          themePreference={themePreference}
+          onChangeTheme={setThemePreference}
+          fontPreferences={fontPreferences}
+          onChangeFonts={handleChangeFonts}
+          onClose={() => {
+            saveAndApplyFontPreferences(fontPreferences);
+            setSettingsModalOpen(false);
           }}
         />
       )}

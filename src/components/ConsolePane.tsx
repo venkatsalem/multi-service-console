@@ -36,6 +36,8 @@ interface ConsolePaneProps {
   snapshot: ServiceSnapshot | null;
   logs: LogLine[];
   isPopout?: boolean;
+  consoleFont?: string;
+  consoleFontSize?: number;
   onStart: (id: string) => void;
   onStop: (id: string, force?: boolean) => void;
   onRestart: (id: string) => void;
@@ -90,6 +92,8 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
   snapshot,
   logs,
   isPopout = false,
+  consoleFont,
+  consoleFontSize = 12.5,
   onStart,
   onStop,
   onRestart,
@@ -249,9 +253,17 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
   const virtualizer = useVirtualizer({
     count: filteredLogs.length,
     getScrollElement: () => scrollContainerRef.current,
-    estimateSize: () => 21,
+    estimateSize: () => Math.max(16, Math.round(consoleFontSize * 1.5) + 2),
     overscan: 24
   });
+
+  // Re-measure row heights after paint whenever console font family or size changes
+  useEffect(() => {
+    const rafId = requestAnimationFrame(() => {
+      virtualizer.measure();
+    });
+    return () => cancelAnimationFrame(rafId);
+  }, [consoleFont, consoleFontSize, wrapLines, showTimestamps, virtualizer]);
 
   const isAutoFollow = !scrollLocked && !userScrolledUp;
 
@@ -830,6 +842,10 @@ export const ConsolePane: React.FC<ConsolePaneProps> = ({
         <div
           ref={scrollContainerRef}
           className={`console-viewport ${wrapLines ? 'wrap-on' : 'wrap-off'}`}
+          style={{
+            ...(consoleFont ? { fontFamily: consoleFont } : {}),
+            fontSize: `${consoleFontSize}px`
+          }}
           onScroll={handleScroll}
           onContextMenu={(e) => {
             e.preventDefault();
