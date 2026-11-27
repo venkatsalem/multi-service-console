@@ -217,6 +217,10 @@ function createMainWindow(): BrowserWindow {
     }
   });
 
+  win.setMenuBarVisibility(false);
+
+  win.setMenuBarVisibility(false);
+
   if (saved.isMaximized) {
     win.maximize();
   }
@@ -310,6 +314,8 @@ function openPopoutWindow(serviceId: string, serviceName?: string): void {
       sandbox: true
     }
   });
+
+  win.setMenuBarVisibility(false);
 
   const webContentsId = win.webContents.id;
   windowPopoutServiceMap.set(webContentsId, serviceId);

@@ -15,6 +15,8 @@ import {
   Search,
   Settings,
   Square,
+  SquareMinus,
+  SquarePlus,
   Terminal,
   X
 } from 'lucide-react';
@@ -44,7 +46,7 @@ interface ProcessSidebarProps {
   onCopyText: (text: string, label: string) => void;
 }
 
-type SidebarFilter = 'all' | 'running' | 'errors';
+type SidebarFilter = 'all' | 'running' | 'stopped' | 'errors';
 
 interface ContextMenuState {
   x: number;
@@ -119,6 +121,7 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
         runtime.status === 'stopping';
 
       if (filterMode === 'running' && !isRunning) continue;
+      if (filterMode === 'stopped' && isRunning) continue;
       if (
         filterMode === 'errors' &&
         runtime.errorCount === 0 &&
@@ -258,7 +261,7 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
             className={`filter-chip ${filterMode === 'running' ? 'active' : ''}`}
             onClick={() => setFilterMode('running')}
           >
-            Running (
+            Run (
             {
               services.filter(
                 (s) =>
@@ -270,10 +273,26 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
           </button>
           <button
             type="button"
+            className={`filter-chip ${filterMode === 'stopped' ? 'active' : ''}`}
+            onClick={() => setFilterMode('stopped')}
+          >
+            Stop (
+            {
+              services.filter(
+                (s) =>
+                  s.runtime.status !== 'running' &&
+                  s.runtime.status !== 'starting' &&
+                  s.runtime.status !== 'stopping'
+              ).length
+            }
+            )
+          </button>
+          <button
+            type="button"
             className={`filter-chip ${filterMode === 'errors' ? 'active' : ''}`}
             onClick={() => setFilterMode('errors')}
           >
-            Errors (
+            Err (
             {
               services.filter(
                 (s) =>
@@ -281,6 +300,26 @@ export const ProcessSidebar: React.FC<ProcessSidebarProps> = ({
               ).length
             }
             )
+          </button>
+          <button
+            type="button"
+            className="icon-btn-xs"
+            disabled={grouped.length === 0}
+            title="Expand All Groups"
+            onClick={() => setCollapsedGroups(new Set())}
+          >
+            <SquarePlus size={13} />
+          </button>
+          <button
+            type="button"
+            className="icon-btn-xs"
+            disabled={grouped.length === 0}
+            title="Collapse All Groups"
+            onClick={() =>
+              setCollapsedGroups(new Set(grouped.map(([groupName]) => groupName)))
+            }
+          >
+            <SquareMinus size={13} />
           </button>
         </div>
       </div>

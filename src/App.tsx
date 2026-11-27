@@ -8,19 +8,17 @@ import React, {
 } from 'react';
 import {
   Check,
+  CheckSquare,
   ChevronDown,
   Download,
   FolderOpen,
   Globe,
-  Monitor,
-  Moon,
   PanelLeftClose,
   PanelLeftOpen,
   Play,
   Save,
   Settings,
   Square,
-  Sun,
   Terminal,
   Upload,
   X
@@ -32,6 +30,8 @@ import {
   ServiceSnapshot,
   WorkspaceSwitchResult
 } from '../shared/types';
+import { BatchStartModal } from './components/BatchStartModal';
+import { ConfirmActionModal } from './components/ConfirmActionModal';
 import { ConsolePane } from './components/ConsolePane';
 import { ProcessSidebar } from './components/ProcessSidebar';
 import { ScanWorkspaceModal } from './components/ScanWorkspaceModal';
@@ -105,7 +105,14 @@ export const App: React.FC = () => {
     editing: ServiceConfig | null;
   }>({ open: false, editing: null });
   const [scanModalOpen, setScanModalOpen] = useState(false);
+  const [batchStartModalOpen, setBatchStartModalOpen] = useState(false);
   const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+  const [pendingSwitchAction, setPendingSwitchAction] = useState<
+    | { kind: 'global' }
+    | { kind: 'workspace'; folderPath?: string }
+    | { kind: 'save-copy' }
+    | null
+  >(null);
   const [fontPreferences, setFontPreferences] = useState<FontPreferences>(() =>
     loadFontPreferences()
   );
@@ -180,12 +187,6 @@ export const App: React.FC = () => {
     window.addEventListener('storage', onStorage);
     return () => window.removeEventListener('storage', onStorage);
   }, []);
-
-  const cycleTheme = () => {
-    setThemePreference((prev) =>
-      prev === 'system' ? 'dark' : prev === 'dark' ? 'light' : 'system'
-    );
-  };
 
   // Bootstrap & live IPC subscriptions
   useEffect(() => {
@@ -393,14 +394,15 @@ export const App: React.FC = () => {
     return Array.from(set);
   }, [services]);
 
-  const runningCount = useMemo(
+  const runningServices = useMemo(
     () =>
       services.filter(
         (s) =>
           s.runtime.status === 'running' || s.runtime.status === 'starting'
-      ).length,
+      ),
     [services]
   );
+  const runningCount = runningServices.length;
 
   const applySwitchResult = useCallback(
     (res: WorkspaceSwitchResult | null) => {
@@ -426,21 +428,12 @@ export const App: React.FC = () => {
     [showToast]
   );
 
-  const confirmSwitchIfRunning = useCallback(() => {
-    if (runningCount === 0) return true;
-    return window.confirm(
-      `${runningCount} process${runningCount === 1 ? ' is' : 'es are'} currently running. Switching configs will stop them first. Continue?`
-    );
-  }, [runningCount]);
-
-  const handleSwitchGlobal = async () => {
-    if (!confirmSwitchIfRunning()) return;
+  const executeSwitchGlobal = async () => {
     const res = await window.serviceConsole.switchToGlobal();
     applySwitchResult(res);
   };
 
-  const handleOpenWorkspace = async (folderPath?: string) => {
-    if (!confirmSwitchIfRunning()) return;
+  const executeOpenWorkspace = async (folderPath?: string) => {
     try {
       const res = await window.serviceConsole.openWorkspace(folderPath);
       applySwitchResult(res);
@@ -452,8 +445,7 @@ export const App: React.FC = () => {
     }
   };
 
-  const handleSaveCopyToWorkspace = async () => {
-    if (!confirmSwitchIfRunning()) return;
+  const executeSaveCopyToWorkspace = async () => {
     try {
       const res = await window.serviceConsole.saveCopyToWorkspace();
       applySwitchResult(res);
@@ -465,17 +457,57 @@ export const App: React.FC = () => {
     }
   };
 
+  const handleSwitchGlobal = async () => {
+    if (runningCount > 0) {
+      setStorageMenuOpen(false);
+      setPendingSwitchAction({ kind: 'global' });
+      return;
+    }
+    await executeSwitchGlobal();
+  };
+
+  const handleOpenWorkspace = async (folderPath?: string) => {
+    if (runningCount > 0) {
+      setStorageMenuOpen(false);
+      setPendingSwitchAction({ kind: 'workspace', folderPath });
+      return;
+    }
+    await executeOpenWorkspace(folderPath);
+  };
+
+  const handleSaveCopyToWorkspace = async () => {
+    if (runningCount > 0) {
+      setStorageMenuOpen(false);
+      setPendingSwitchAction({ kind: 'save-copy' });
+      return;
+    }
+    await executeSaveCopyToWorkspace();
+  };
+
+  const handleStartSelectedServices = async (serviceIds: string[]) => {
+    const toStart = serviceIds.filter((id) => {
+      const snap = services.find((s) => s.config.id === id);
+      return (
+        snap &&
+        snap.runtime.status !== 'running' &&
+        snap.runtime.status !== 'starting' &&
+        snap.runtime.status !== 'stopping'
+      );
+    });
+    if (toStart.length === 0) {
+      showToast('All selected services are already running');
+      return;
+    }
+    await Promise.all(
+      toStart.map((id) => window.serviceConsole.startService(id))
+    );
+    showToast(`Started ${toStart.length} selected service(s)`);
+  };
+
   const workspaceFolderLabel = storage?.workspaceRoot
     ? storage.workspaceRoot.split(/[/\\]/).filter(Boolean).pop() ||
       storage.workspaceRoot
     : null;
-
-  const ThemeIcon =
-    themePreference === 'system'
-      ? Monitor
-      : themePreference === 'dark'
-        ? Moon
-        : Sun;
 
   // Pop-out Dedicated Console Window Mode
   if (popoutServiceId) {
@@ -484,20 +516,24 @@ export const App: React.FC = () => {
         <header className="top-bar">
           <div className="top-bar-left">
             <div className="app-title">
-              <Terminal size={16} className="app-logo-icon" />
-              <span>Multi-Service Console</span>
+              <span
+                title="Multi-Service Console"
+                style={{ display: 'inline-flex', alignItems: 'center' }}
+              >
+                <Terminal size={16} className="app-logo-icon" />
+              </span>
+              <span>{activeSnapshot?.config.name || 'Service Console'}</span>
               <span className="popout-badge">Pop-Out Window</span>
             </div>
           </div>
           <div className="top-bar-right">
             <button
               type="button"
-              className="btn btn-secondary"
-              onClick={cycleTheme}
-              title={`Theme: ${themePreference}`}
+              className="icon-btn"
+              onClick={() => setSettingsModalOpen(true)}
+              title="Settings (Theme & Fonts)"
             >
-              <ThemeIcon size={14} />
-              {themePreference}
+              <Settings size={15} />
             </button>
           </div>
         </header>
@@ -520,6 +556,19 @@ export const App: React.FC = () => {
             onSaveLog={(name, content) => void handleSaveLog(name, content)}
           />
         </div>
+
+        {settingsModalOpen && (
+          <SettingsModal
+            themePreference={themePreference}
+            onChangeTheme={setThemePreference}
+            fontPreferences={fontPreferences}
+            onChangeFonts={handleChangeFonts}
+            onClose={() => {
+              saveAndApplyFontPreferences(fontPreferences);
+              setSettingsModalOpen(false);
+            }}
+          />
+        )}
 
         {toast && (
           <div className={`toast toast-${toast.kind}`}>
@@ -554,10 +603,12 @@ export const App: React.FC = () => {
             )}
           </button>
 
-          <div className="app-title">
+          <span
+            title="Multi-Service Console"
+            style={{ display: 'inline-flex', alignItems: 'center' }}
+          >
             <Terminal size={16} className="app-logo-icon" />
-            <span>Multi-Service Console</span>
-          </div>
+          </span>
 
           <div className="storage-switcher" ref={storageMenuRef}>
             <button
@@ -745,12 +796,8 @@ export const App: React.FC = () => {
             )}
           </div>
 
-          <span className="summary-pill">
-            {runningCount} Running · {services.length} Configured
-          </span>
-        </div>
+          <div className="toolbar-divider" />
 
-        <div className="top-bar-right">
           <button
             type="button"
             className="btn btn-start-subtle"
@@ -764,6 +811,17 @@ export const App: React.FC = () => {
 
           <button
             type="button"
+            className="btn btn-secondary"
+            disabled={services.length === 0}
+            onClick={() => setBatchStartModalOpen(true)}
+            title="Choose which services to start (remembers excluded services)"
+          >
+            <CheckSquare size={13} />
+            Start Selected...
+          </button>
+
+          <button
+            type="button"
             className="btn btn-stop-subtle"
             disabled={runningCount === 0}
             onClick={() => void window.serviceConsole.stopAll(false)}
@@ -772,6 +830,12 @@ export const App: React.FC = () => {
             <Square size={12} />
             Stop All
           </button>
+        </div>
+
+        <div className="top-bar-right">
+          <span className="summary-pill">
+            {runningCount} Running · {services.length} Configured
+          </span>
         </div>
       </header>
 
@@ -898,6 +962,35 @@ export const App: React.FC = () => {
               setSelectedServiceId(updated[0].config.id);
             }
             showToast(`Imported ${configs.length} service(s)`);
+          }}
+        />
+      )}
+
+      {batchStartModalOpen && (
+        <BatchStartModal
+          services={services}
+          onStartSelected={handleStartSelectedServices}
+          onClose={() => setBatchStartModalOpen(false)}
+        />
+      )}
+
+      {pendingSwitchAction && (
+        <ConfirmActionModal
+          title="Stop Running Processes?"
+          description={`${runningCount} process${runningCount === 1 ? ' is' : 'es are'} currently running. Switching configs will stop them before loading the new profile.`}
+          confirmLabel="Stop All & Switch"
+          runningServices={runningServices}
+          onCancel={() => setPendingSwitchAction(null)}
+          onConfirm={() => {
+            const action = pendingSwitchAction;
+            setPendingSwitchAction(null);
+            if (action.kind === 'global') {
+              void executeSwitchGlobal();
+            } else if (action.kind === 'workspace') {
+              void executeOpenWorkspace(action.folderPath);
+            } else {
+              void executeSaveCopyToWorkspace();
+            }
           }}
         />
       )}

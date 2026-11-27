@@ -961,6 +961,8 @@ textarea {
 .context-menu {
   position: fixed;
   min-width: 185px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 5px;
   border-radius: 8px;
   background: var(--bg-panel);
@@ -1823,4 +1825,69 @@ textarea {
   padding: 7px 9px;
   justify-content: center;
   flex-shrink: 0;
+}
+
+.btn-xs {
+  padding: 2px 7px;
+  font-size: 0.808rem;
+}
+
+.batch-select-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.batch-service-list,
+.confirm-service-list {
+  max-height: 230px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-root);
+}
+
+.batch-service-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.923rem;
+}
+
+.batch-service-row:last-child,
+.confirm-service-item:last-child {
+  border-bottom: none;
+}
+
+.batch-service-row:hover {
+  background: var(--bg-hover);
+}
+
+.batch-service-row.excluded {
+  opacity: 0.56;
+}
+
+.batch-service-name {
+  font-weight: 500;
+  color: var(--text-primary);
+}
+
+.pill-running {
+  color: var(--green);
+  border-color: var(--green);
+}
+
+.confirm-service-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.923rem;
 }
